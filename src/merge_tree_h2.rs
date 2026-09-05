@@ -1,11 +1,15 @@
 use anyhow::{Result, bail};
 use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::connectivity::Connectivity;
 use crate::io::{Block, TiffStackReader};
 use crate::local_pruning::NeighborhoodComponentPruner;
-use crate::merge_tree_common::{H2Branch, H2BranchMerge, H2TreeRecorder, MergeTree};
+use crate::merge_tree_common::{
+    CompactH2BranchMerge, H2Branch, H2BranchMerge, H2PackedTreeRecorder, H2TreeRecorder, MergeTree,
+    OUTSIDE_BRANCH_ID, PackedDeferredIdResolver,
+};
 use crate::slab_interface::{
     NO_INTERFACE_REP, face_node_id, interface_node_count as slab_interface_node_count,
     local_boundary_node_id,
@@ -462,6 +466,81 @@ struct GlobalPairEvent {
     b: u32,
 }
 
+#[derive(Debug, Default)]
+struct H2DeferredParentResolver {
+    watched: HashSet<u64>,
+    redirect: HashMap<u64, H2Branch>,
+}
+
+impl H2DeferredParentResolver {
+    fn from_local_events(local_by_value: &[Vec<H2BranchMerge>]) -> Self {
+        let watched = local_by_value
+            .iter()
+            .flatten()
+            .filter_map(|event| event.parent.finite_id())
+            .collect();
+        Self {
+            watched,
+            redirect: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_compact_local_events(local_by_value: &[Vec<CompactH2BranchMerge>]) -> Self {
+        let watched = local_by_value
+            .iter()
+            .flatten()
+            .filter_map(|event| {
+                (event.parent_id != crate::merge_tree_common::OUTSIDE_BRANCH_ID)
+                    .then_some(event.parent_id)
+            })
+            .collect();
+        Self {
+            watched,
+            redirect: HashMap::new(),
+        }
+    }
+
+    fn resolve(&self, parent: H2Branch) -> H2Branch {
+        let mut current = parent;
+        while let Some(id) = current.finite_id() {
+            let Some(&next) = self.redirect.get(&id) else {
+                break;
+            };
+            current = next;
+        }
+        current
+    }
+
+    fn observe_parts(&mut self, child_id: u64, parent: H2Branch) {
+        if !self.watched.contains(&child_id) {
+            return;
+        }
+        self.redirect.insert(child_id, parent);
+        if let Some(parent_id) = parent.finite_id() {
+            self.watched.insert(parent_id);
+        }
+    }
+
+    fn observe(&mut self, merge: H2BranchMerge) {
+        self.observe_parts(merge.child_id, merge.parent);
+    }
+}
+
+fn repair_h2_local_event(
+    event: H2BranchMerge,
+    resolver: Option<&H2DeferredParentResolver>,
+) -> H2BranchMerge {
+    if let Some(resolver) = resolver {
+        H2BranchMerge {
+            parent: resolver.resolve(event.parent),
+            ..event
+        }
+    } else {
+        event
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GlobalH2MergeTreeUnionFind {
     parent: Vec<u32>,
@@ -505,6 +584,7 @@ impl GlobalH2MergeTreeUnionFind {
 
         let branch_a = self.branch[root_a as usize];
         let branch_b = self.branch[root_b as usize];
+        let same_branch = branch_a == branch_b;
         let older = branch_a.older(branch_b);
         let younger = branch_a.younger(branch_b);
 
@@ -519,12 +599,16 @@ impl GlobalH2MergeTreeUnionFind {
         }
         self.branch[root_a as usize] = older;
 
-        younger.map(|(child_id, child_birth)| H2BranchMerge {
-            value,
-            child_id,
-            child_birth,
-            parent: older,
-        })
+        if same_branch {
+            None
+        } else {
+            younger.map(|(child_id, child_birth)| H2BranchMerge {
+                value,
+                child_id,
+                child_birth,
+                parent: older,
+            })
+        }
     }
 
     pub(crate) fn attach(
@@ -539,6 +623,9 @@ impl GlobalH2MergeTreeUnionFind {
 
         let root = self.find(interface_node);
         let root_branch = self.branch[root as usize];
+        if root_branch == branch {
+            return None;
+        }
         let older = root_branch.older(branch);
         let younger = root_branch.younger(branch);
         self.branch[root as usize] = older;
@@ -651,16 +738,55 @@ fn generate_cross_slab_events(
     events
 }
 
-fn reduce_merge_tree(
+pub(crate) fn reduce_merge_tree(
     summaries: &[SlabH2MergeTreeSummary],
     connectivity: Connectivity,
+) -> Result<MergeTree> {
+    reduce_merge_tree_impl(summaries, connectivity, false, None)
+}
+
+pub(crate) fn reduce_merge_tree_with_deferred_parent_repair(
+    summaries: &[SlabH2MergeTreeSummary],
+    connectivity: Connectivity,
+) -> Result<MergeTree> {
+    reduce_merge_tree_impl(summaries, connectivity, true, None)
+}
+
+pub(crate) fn reduce_merge_tree_with_deferred_parent_repair_prebucketed(
+    summary: &SlabH2MergeTreeSummary,
+    compact_local_by_value: Vec<Vec<CompactH2BranchMerge>>,
+    connectivity: Connectivity,
+) -> Result<MergeTree> {
+    reduce_merge_tree_impl(
+        std::slice::from_ref(summary),
+        connectivity,
+        true,
+        Some(compact_local_by_value),
+    )
+}
+
+fn reduce_merge_tree_impl(
+    summaries: &[SlabH2MergeTreeSummary],
+    connectivity: Connectivity,
+    repair_deferred_parents: bool,
+    prebucketed_local: Option<Vec<Vec<CompactH2BranchMerge>>>,
 ) -> Result<MergeTree> {
     let offsets = build_interface_offsets(summaries);
     let branches = build_global_interface_branches(summaries, &offsets);
     let mut global_uf = GlobalH2MergeTreeUnionFind::new(branches);
 
-    let mut local_by_value: Vec<Vec<H2BranchMerge>> =
-        (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
+    let using_prebucketed_local = prebucketed_local.is_some();
+    if let Some(local_by_value) = prebucketed_local.as_ref()
+        && local_by_value.len() != NUM_U16_VALUES
+    {
+        anyhow::bail!(
+            "H2 compact prebucketed local event table has {} buckets; expected {}",
+            local_by_value.len(),
+            NUM_U16_VALUES
+        );
+    }
+    let mut local_by_value: Option<Vec<Vec<H2BranchMerge>>> =
+        (!using_prebucketed_local).then(|| (0..NUM_U16_VALUES).map(|_| Vec::new()).collect());
     let mut attach_by_value: Vec<Vec<GlobalAttachEvent>> =
         (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
     let mut interface_by_value: Vec<Vec<GlobalPairEvent>> =
@@ -669,8 +795,14 @@ fn reduce_merge_tree(
         (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
 
     for summary in summaries {
-        for &event in &summary.local_merge_events {
-            local_by_value[event.value as usize].push(event);
+        if let Some(local_by_value) = local_by_value.as_mut() {
+            for &event in &summary.local_merge_events {
+                local_by_value[event.value as usize].push(event);
+            }
+        } else if !summary.local_merge_events.is_empty() {
+            anyhow::bail!(
+                "H2 compact prebucketed reduction requires summary.local_merge_events to be empty"
+            );
         }
         for event in &summary.attach_events {
             let node = global_node_id(&offsets, summary.slab_id, event.interface_node);
@@ -694,39 +826,237 @@ fn reduce_merge_tree(
         cross_by_value[event.value as usize].push(event);
     }
 
+    if let Some(compact) = prebucketed_local.as_ref() {
+        // Hierarchical packed fast path. Deferred-parent resolution and
+        // same-threshold plateau contraction use integer-only open-addressed
+        // state; the flat reducer below remains the independent reference.
+        let mut resolver = if repair_deferred_parents {
+            let mut resolver = PackedDeferredIdResolver::default();
+            for event in compact.iter().flatten() {
+                resolver.watch(event.parent_id);
+            }
+            Some(resolver)
+        } else {
+            None
+        };
+        let mut recorder = H2PackedTreeRecorder::default();
+        let mut outside_attach_merges: Vec<H2BranchMerge> = Vec::new();
+        let mut finite_attach_merges: Vec<H2BranchMerge> = Vec::new();
+        let mut duplicate_targets: HashSet<(u64, u64)> = HashSet::new();
+        let mut matched_duplicates: HashSet<(u64, u64)> = HashSet::new();
+        let mut resolved_local_parent_ids: Vec<u64> = Vec::new();
+        let mut observed_prefix: Vec<(u64, u64)> = Vec::new();
+        let mut observed_suffix: Vec<(u64, u64)> = Vec::new();
+
+        for value in (0..NUM_U16_VALUES).rev() {
+            let value_u16 = value as u16;
+            outside_attach_merges.clear();
+            finite_attach_merges.clear();
+            duplicate_targets.clear();
+            matched_duplicates.clear();
+            resolved_local_parent_ids.clear();
+            observed_prefix.clear();
+            observed_suffix.clear();
+
+            // Preserve the exact global-UF mutation order from v5.
+            outside_attach_merges.reserve(attach_by_value[value].len());
+            for event in &attach_by_value[value] {
+                if event.branch == H2Branch::Outside
+                    && let Some(merge) = global_uf.attach(event.node, event.branch, value_u16)
+                {
+                    outside_attach_merges.push(merge);
+                }
+            }
+            finite_attach_merges.reserve(attach_by_value[value].len());
+            for event in &attach_by_value[value] {
+                if event.branch != H2Branch::Outside
+                    && let Some(merge) = global_uf.attach(event.node, event.branch, value_u16)
+                {
+                    finite_attach_merges.push(merge);
+                }
+            }
+
+            if repair_deferred_parents {
+                duplicate_targets.extend(
+                    outside_attach_merges
+                        .iter()
+                        .chain(finite_attach_merges.iter())
+                        .map(|merge| {
+                            let parent_id = match merge.parent {
+                                H2Branch::Outside => OUTSIDE_BRANCH_ID,
+                                H2Branch::Finite { id, .. } => id,
+                            };
+                            (merge.child_id, parent_id)
+                        }),
+                );
+                matched_duplicates.reserve(duplicate_targets.len());
+            }
+
+            resolved_local_parent_ids.reserve(compact[value].len());
+            for &event in &compact[value] {
+                let repaired_parent_id = if let Some(resolver) = resolver.as_ref() {
+                    resolver.resolve_id(event.parent_id)?
+                } else {
+                    event.parent_id
+                };
+                if !duplicate_targets.is_empty()
+                    && duplicate_targets.contains(&(event.child_id, repaired_parent_id))
+                {
+                    matched_duplicates.insert((event.child_id, repaired_parent_id));
+                }
+                resolved_local_parent_ids.push(repaired_parent_id);
+            }
+
+            for &merge in &outside_attach_merges {
+                let parent_id = match merge.parent {
+                    H2Branch::Outside => OUTSIDE_BRANCH_ID,
+                    H2Branch::Finite { id, .. } => id,
+                };
+                let duplicate_hierarchical_transition = repair_deferred_parents
+                    && matched_duplicates.contains(&(merge.child_id, parent_id));
+                if !duplicate_hierarchical_transition {
+                    recorder.record_merge(merge)?;
+                    observed_prefix.push((merge.child_id, parent_id));
+                }
+            }
+
+            for (&event, &repaired_parent_id) in
+                compact[value].iter().zip(resolved_local_parent_ids.iter())
+            {
+                recorder.record_compact_merge_parent_id(value_u16, event, repaired_parent_id)?;
+            }
+
+            for &merge in &finite_attach_merges {
+                let parent_id = match merge.parent {
+                    H2Branch::Outside => OUTSIDE_BRANCH_ID,
+                    H2Branch::Finite { id, .. } => id,
+                };
+                let duplicate_hierarchical_transition = repair_deferred_parents
+                    && matched_duplicates.contains(&(merge.child_id, parent_id));
+                if !duplicate_hierarchical_transition {
+                    recorder.record_merge(merge)?;
+                    observed_suffix.push((merge.child_id, parent_id));
+                }
+            }
+            for event in &interface_by_value[value] {
+                if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
+                    let parent_id = match merge.parent {
+                        H2Branch::Outside => OUTSIDE_BRANCH_ID,
+                        H2Branch::Finite { id, .. } => id,
+                    };
+                    recorder.record_merge(merge)?;
+                    observed_suffix.push((merge.child_id, parent_id));
+                }
+            }
+            for event in &cross_by_value[value] {
+                if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
+                    let parent_id = match merge.parent {
+                        H2Branch::Outside => OUTSIDE_BRANCH_ID,
+                        H2Branch::Finite { id, .. } => id,
+                    };
+                    recorder.record_merge(merge)?;
+                    observed_suffix.push((merge.child_id, parent_id));
+                }
+            }
+
+            recorder.finish_threshold()?;
+            if let Some(resolver) = resolver.as_mut() {
+                // Preserve exact observation order: outside attaches, local
+                // events, finite attaches, interface events, cross events.
+                for &(child_id, parent_id) in &observed_prefix {
+                    resolver.observe(child_id, parent_id);
+                }
+                for (&event, &repaired_parent_id) in
+                    compact[value].iter().zip(resolved_local_parent_ids.iter())
+                {
+                    resolver.observe(event.child_id, repaired_parent_id);
+                }
+                for &(child_id, parent_id) in &observed_suffix {
+                    resolver.observe(child_id, parent_id);
+                }
+            }
+        }
+
+        let remaining = global_uf.remaining_finite_roots();
+        if !remaining.is_empty() {
+            bail!(
+                "H2 merge-tree reduction ended with {} background components not connected to outside",
+                remaining.len()
+            );
+        }
+        recorder.add_outside_root();
+        return recorder.into_tree();
+    }
+
+    // General flat/in-memory reference reducer retained unchanged.
+    let local = local_by_value
+        .as_ref()
+        .expect("non-prebucketed H2 reducer must own local event buckets");
+    let mut resolver = if repair_deferred_parents {
+        Some(H2DeferredParentResolver::from_local_events(local))
+    } else {
+        None
+    };
     let mut recorder = H2TreeRecorder::default();
     for value in (0..NUM_U16_VALUES).rev() {
         let value_u16 = value as u16;
+        let mut observed_merges = Vec::new();
+
+        let mut recorded_local_merges: HashSet<(u64, Option<u64>)> = HashSet::new();
+        for &event in &local[value] {
+            let repaired = repair_h2_local_event(event, resolver.as_ref());
+            recorded_local_merges.insert((repaired.child_id, repaired.parent.finite_id()));
+        }
 
         for event in &attach_by_value[value] {
             if event.branch == H2Branch::Outside
                 && let Some(merge) = global_uf.attach(event.node, event.branch, value_u16)
             {
-                recorder.record_merge(merge)?;
+                let duplicate_hierarchical_transition = repair_deferred_parents
+                    && recorded_local_merges.contains(&(merge.child_id, merge.parent.finite_id()));
+                if !duplicate_hierarchical_transition {
+                    recorder.record_merge(merge)?;
+                    observed_merges.push(merge);
+                }
             }
         }
-        for &event in &local_by_value[value] {
-            recorder.record_merge(event)?;
+
+        for &event in &local[value] {
+            let repaired = repair_h2_local_event(event, resolver.as_ref());
+            recorder.record_merge(repaired)?;
+            observed_merges.push(repaired);
         }
         for event in &attach_by_value[value] {
             if event.branch != H2Branch::Outside
                 && let Some(merge) = global_uf.attach(event.node, event.branch, value_u16)
             {
-                recorder.record_merge(merge)?;
+                let duplicate_hierarchical_transition = repair_deferred_parents
+                    && recorded_local_merges.contains(&(merge.child_id, merge.parent.finite_id()));
+                if !duplicate_hierarchical_transition {
+                    recorder.record_merge(merge)?;
+                    observed_merges.push(merge);
+                }
             }
         }
         for event in &interface_by_value[value] {
             if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
                 recorder.record_merge(merge)?;
+                observed_merges.push(merge);
             }
         }
         for event in &cross_by_value[value] {
             if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
                 recorder.record_merge(merge)?;
+                observed_merges.push(merge);
             }
         }
 
         recorder.finish_threshold()?;
+        if let Some(resolver) = resolver.as_mut() {
+            for merge in observed_merges {
+                resolver.observe(merge);
+            }
+        }
     }
 
     let remaining = global_uf.remaining_finite_roots();
@@ -758,4 +1088,84 @@ pub fn compute_h2_merge_tree_zslabs(
         start.elapsed().as_secs_f64()
     );
     Ok(tree)
+}
+
+#[cfg(test)]
+mod deferred_parent_tests {
+    use super::*;
+
+    #[test]
+    fn global_h2_same_branch_replay_does_not_emit_a_second_death() {
+        let branch = H2Branch::Finite { id: 10, birth: 12 };
+        let mut uf = GlobalH2MergeTreeUnionFind::new(vec![branch, branch]);
+
+        assert!(uf.attach(0, branch, 8).is_none());
+        assert!(uf.union(0, 1, 8).is_none());
+        assert_eq!(uf.remaining_finite_roots(), vec![branch]);
+    }
+
+    #[test]
+    fn deferred_h2_parent_follows_an_earlier_superlevel_death() {
+        let provisional_parent = H2Branch::Finite { id: 20, birth: 12 };
+        let survivor = H2Branch::Finite { id: 30, birth: 14 };
+        let local = [vec![H2BranchMerge {
+            value: 4,
+            child_id: 10,
+            child_birth: 9,
+            parent: provisional_parent,
+        }]];
+        let mut resolver = H2DeferredParentResolver::from_local_events(&local);
+
+        resolver.observe(H2BranchMerge {
+            value: 8,
+            child_id: 20,
+            child_birth: 12,
+            parent: survivor,
+        });
+
+        assert_eq!(resolver.resolve(provisional_parent), survivor);
+    }
+
+    #[test]
+    fn deferred_h2_parent_compact_bucket_matches_full_bucket() {
+        let provisional_parent = H2Branch::Finite { id: 20, birth: 12 };
+        let survivor = H2Branch::Finite { id: 30, birth: 14 };
+        let compact = [vec![CompactH2BranchMerge::from_merge(H2BranchMerge {
+            value: 4,
+            child_id: 10,
+            child_birth: 9,
+            parent: provisional_parent,
+        })]];
+        let mut resolver = H2DeferredParentResolver::from_compact_local_events(&compact);
+
+        resolver.observe(H2BranchMerge {
+            value: 8,
+            child_id: 20,
+            child_birth: 12,
+            parent: survivor,
+        });
+
+        assert_eq!(resolver.resolve(provisional_parent), survivor);
+    }
+
+    #[test]
+    fn deferred_h2_parent_can_resolve_to_outside() {
+        let provisional_parent = H2Branch::Finite { id: 20, birth: 12 };
+        let local = [vec![H2BranchMerge {
+            value: 3,
+            child_id: 10,
+            child_birth: 9,
+            parent: provisional_parent,
+        }]];
+        let mut resolver = H2DeferredParentResolver::from_local_events(&local);
+
+        resolver.observe(H2BranchMerge {
+            value: 7,
+            child_id: 20,
+            child_birth: 12,
+            parent: H2Branch::Outside,
+        });
+
+        assert_eq!(resolver.resolve(provisional_parent), H2Branch::Outside);
+    }
 }

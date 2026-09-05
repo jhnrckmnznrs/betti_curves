@@ -528,7 +528,9 @@ fn reduce_runs(prepared: &PreparedRuns) -> Result<MergeTree> {
         }
         for reader in &mut attach_readers {
             while let Some((node, branch)) = reader.pop_at_value(value_u16)? {
-                recorder.record_merge(global_uf.attach(node, branch, value_u16))?;
+                if let Some(merge) = global_uf.attach(node, branch, value_u16) {
+                    recorder.record_merge(merge)?;
+                }
             }
         }
         for reader in &mut interface_readers {

@@ -118,3 +118,9 @@ Before topology work, checked size planning validates products and identifier li
 | Branch summaries | `merge_tree_*.rs` |
 | Tuning / configuration | `scalar_stream_tuning.rs`, `size_plan.rs` |
 | Transactional output / runs | `atomic_output.rs`, `binary_io.rs`, `temp_runs.rs` |
+
+## Hierarchical branch trees
+
+The H0/H2 elder-rule branch-tree modes now have a shared hierarchical fan-in path. Unlike the historical event-order tree, the hierarchical result is plateau-canonical: positive branches that merge through the same equal-valued plateau point directly to the oldest branch that survives beyond that plateau. This makes the ancestry invariant to equal-value edge order and allows the same filtration-preserving interface sparsifier used by persistence.
+
+The pair frontier remains bounded by a small multiple of one z-face. The current final `MergeTree` node table is still materialized, so branch-output size remains a separate memory term. See [`branch-tree-hierarchy.md`](branch-tree-hierarchy.md).

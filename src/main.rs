@@ -28,6 +28,7 @@ mod merge_tree_h0;
 mod merge_tree_h0_stream;
 mod merge_tree_h2;
 mod merge_tree_h2_stream;
+mod merge_tree_hierarchical;
 mod persistence_h0;
 mod persistence_h0_scalar;
 mod persistence_h0_scalar_stream;
@@ -67,6 +68,9 @@ use merge_tree_h0::compute_h0_merge_tree_zslabs;
 use merge_tree_h0_stream::compute_h0_merge_tree_stream_zslabs;
 use merge_tree_h2::compute_h2_merge_tree_zslabs;
 use merge_tree_h2_stream::compute_h2_merge_tree_stream_zslabs;
+use merge_tree_hierarchical::{
+    compute_h0_merge_tree_hierarchical_zslabs, compute_h2_merge_tree_hierarchical_zslabs,
+};
 use persistence_h0::{
     betti0_curve_from_h0_intervals, compute_h0_persistence_zslabs, write_h0_persistence_csv,
 };
@@ -143,8 +147,10 @@ fn print_usage() {
     );
     eprintln!("  h2-scalar-batch-stream disk-backed recursive batch processing");
     eprintln!("  branch-tree-h0        in-memory H0 elder-rule branch tree");
+    eprintln!("  branch-tree-h0-hierarchical bounded-interface H0 plateau-canonical branch tree");
     eprintln!("  branch-tree-h0-stream disk-backed H0 elder-rule branch tree");
     eprintln!("  branch-tree-h2        in-memory H2 elder-rule branch tree");
+    eprintln!("  branch-tree-h2-hierarchical bounded-interface H2 plateau-canonical branch tree");
     eprintln!("  branch-tree-h2-stream disk-backed H2 elder-rule branch tree");
     eprintln!("  (legacy merge-tree-* spellings remain accepted)");
     eprintln!();
@@ -231,8 +237,10 @@ fn print_usage() {
     eprintln!("  cargo run --release -- /data/float_volume 32 26 h2-scalar-stream output.csv");
     eprintln!("  cargo run --release -- /data/datasets 32 26 h2-scalar-batch-stream results");
     eprintln!("  cargo run --release -- /data/volume 32 26 branch-tree-h0");
+    eprintln!("  cargo run --release -- /data/volume 32 26 branch-tree-h0-hierarchical");
     eprintln!("  cargo run --release -- /data/volume 32 26 branch-tree-h0-stream");
     eprintln!("  cargo run --release -- /data/volume 32 26 branch-tree-h2");
+    eprintln!("  cargo run --release -- /data/volume 32 26 branch-tree-h2-hierarchical");
     eprintln!("  cargo run --release -- /data/volume 32 26 branch-tree-h2-stream");
 }
 
@@ -755,6 +763,7 @@ fn planning_connectivity(
         | Mode::PersistenceH2ScalarHierarchicalStream
         | Mode::PersistenceH2ScalarBatchStream
         | Mode::MergeTreeH2
+        | Mode::MergeTreeH2Hierarchical
         | Mode::MergeTreeH2Stream => background,
         Mode::Both => connectivity::Connectivity::TwentySix,
         _ => foreground,
@@ -1283,7 +1292,14 @@ h0-scalar-hierarchical-stream, h0-scalar-batch-stream, h2-scalar-stream, h2-scal
 
     let volume = TiffStackReader::open(dir)?;
     print_volume_info(&volume);
-    preflight(volume.shape(), slab_depth, plan_connectivity)?;
+    if matches!(
+        mode,
+        Mode::MergeTreeH0Hierarchical | Mode::MergeTreeH2Hierarchical
+    ) {
+        preflight_hierarchical(volume.shape(), slab_depth, plan_connectivity)?;
+    } else {
+        preflight(volume.shape(), slab_depth, plan_connectivity)?;
+    }
     if dry_run_plan {
         return Ok(());
     }
@@ -1486,6 +1502,24 @@ h0-scalar-hierarchical-stream, h0-scalar-batch-stream, h2-scalar-stream, h2-scal
             println!("Retained branch-tree nodes: {}", tree.node_count);
         }
 
+        Mode::MergeTreeH0Hierarchical => {
+            let tree = compute_h0_merge_tree_hierarchical_zslabs(
+                &volume,
+                slab_depth,
+                foreground_connectivity,
+            )?;
+            let output = Path::new("h0_branch_tree_hierarchical.csv");
+            write_merge_tree_csv(output, &tree)?;
+            println!("Wrote hierarchical H0 branch tree to {:?}", output);
+            let nodes_output = Path::new("h0_branch_tree_hierarchical_nodes.csv");
+            write_merge_tree_nodes_csv(nodes_output, &tree)?;
+            println!(
+                "Wrote plateau-canonical hierarchical H0 branch-tree nodes to {:?}",
+                nodes_output
+            );
+            println!("Retained branch-tree nodes: {}", tree.node_count);
+        }
+
         Mode::MergeTreeH0Stream => {
             let tree =
                 compute_h0_merge_tree_stream_zslabs(&volume, slab_depth, foreground_connectivity)?;
@@ -1510,6 +1544,24 @@ h0-scalar-hierarchical-stream, h0-scalar-batch-stream, h2-scalar-stream, h2-scal
             write_merge_tree_nodes_csv(nodes_output, &tree)?;
             println!(
                 "Wrote H2 elder-rule branch-tree nodes to {:?}",
+                nodes_output
+            );
+            println!("Retained branch-tree nodes: {}", tree.node_count);
+        }
+
+        Mode::MergeTreeH2Hierarchical => {
+            let tree = compute_h2_merge_tree_hierarchical_zslabs(
+                &volume,
+                slab_depth,
+                background_connectivity,
+            )?;
+            let output = Path::new("h2_branch_tree_hierarchical.csv");
+            write_merge_tree_csv(output, &tree)?;
+            println!("Wrote hierarchical H2 branch tree to {:?}", output);
+            let nodes_output = Path::new("h2_branch_tree_hierarchical_nodes.csv");
+            write_merge_tree_nodes_csv(nodes_output, &tree)?;
+            println!(
+                "Wrote plateau-canonical hierarchical H2 branch-tree nodes to {:?}",
                 nodes_output
             );
             println!("Retained branch-tree nodes: {}", tree.node_count);
