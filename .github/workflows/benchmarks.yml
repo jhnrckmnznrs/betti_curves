@@ -52,7 +52,7 @@ jobs:
           python benchmarks/compare_curves.py /tmp/python-baseline/python_betti2.csv /tmp/rust-betti2.csv
       - name: Plot results
         run: python benchmarks/plot_results.py benchmark_results.csv --output-dir benchmark_plots
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: synthetic-benchmark-${{ github.sha }}
           path: |

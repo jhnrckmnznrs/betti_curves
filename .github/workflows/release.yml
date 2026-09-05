@@ -36,7 +36,7 @@ jobs:
           python-version: '3.12'
       - name: Package binary
         run: python scripts/package_binary.py --binary target/release/${{ matrix.exe }} --label ${{ matrix.artifact }} --version ${{ github.ref_name }} --output-dir dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/*
