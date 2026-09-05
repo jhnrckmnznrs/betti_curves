@@ -168,6 +168,8 @@ The executable intentionally keeps reference and optimized implementations in on
 | `h0-scalar-hierarchical-stream` | bounded-memory hierarchical H0 persistence |
 | `h2-scalar-hierarchical-stream` | outside-aware hierarchical H2 persistence |
 | `branch-tree-h0*`, `branch-tree-h2*` | elder-rule branch summaries |
+| `branch-tree-h0-hierarchical` | bounded-interface plateau-canonical H0 branch tree |
+| `branch-tree-h2-hierarchical` | bounded-interface plateau-canonical H2 branch tree |
 
 Run:
 
@@ -235,6 +237,10 @@ scripts/profile_flamegraph.sh /path/to/slices 16 26 h2-scalar-hierarchical-strea
 
 See [`docs/performance-profiling.md`](docs/performance-profiling.md) for interpretation guidance and the current known hot-path categories.
 
+## Hierarchical branch trees
+
+The branch-tree hierarchy extends the slab-summary architecture to elder-rule ancestry while removing equal-threshold event-order ambiguity through plateau-canonical parenting. Pairwise reconciliation remains bounded by a small multiple of one image face; the current final node table is still materialized in memory. See [`docs/branch-tree-hierarchy.md`](docs/branch-tree-hierarchy.md).
+
 ## Repository layout
 
 ```text
@@ -253,7 +259,7 @@ scripts/                  production profiling and reproducibility helpers
 
 The project follows [Semantic Versioning](https://semver.org/). The current repository-ready version is **0.2.0**. Tagged `v*` releases are configured to build and attach binaries for Linux, macOS, and Windows through GitHub Actions.
 
-See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releasing.md`](docs/releasing.md). Repository-rename steps are documented in [`docs/github-migration.md`](docs/github-migration.md).
+See [`CHANGELOG.md`](CHANGELOG.md), [`docs/releasing.md`](docs/releasing.md), and [`docs/source-layout.md`](docs/source-layout.md). Repository-rename steps are documented in [`docs/github-migration.md`](docs/github-migration.md).
 
 ## Contributing
 

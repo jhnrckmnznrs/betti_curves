@@ -50,3 +50,19 @@ The committed development profiles show two examples of optimization driven by s
 - H2 direct-cross consumption reduced filesystem outputs by roughly 17–19% on CX09T1 while preserving the exact 220,093-interval barcode. Outside-dominated structural pruning then reduced hierarchical summary storage by about one third at d8/d16.
 
 These observations motivate the current architecture but should not be treated as portable CPU benchmarks. Re-run the public suite on the target machine before making hardware-specific claims.
+
+
+## Hierarchical branch-tree stage timers
+
+The hierarchical H0/H2 modes emit `PROFILE_BRANCH_H0_HIERARCHY` / `PROFILE_BRANCH_H2_HIERARCHY` lines with wall-clock stage counters. The main fields are:
+
+- `leaf_batch_seconds`: wall time spent running leaf-slab batches, including TIFF reads and leaf computation.
+- `leaf_read_thread_seconds`: sum of per-leaf read times across worker threads; this can exceed wall time under parallel execution.
+- `leaf_compute_thread_seconds`: sum of per-leaf topology-computation times across worker threads; this can also exceed wall time.
+- `bucket_seconds`: time moving finalized local events into compact threshold buckets.
+- `fan_in_seconds`: time spent in binary-carry fan-in combines triggered while ingesting leaves.
+- `root_combine_seconds`: time combining the residual summaries after the carry slots are drained.
+- `root_reduce_seconds`: time for the final global interface union-find/deferred-parent reduction.
+- `canonical_seconds`: time for plateau-canonical tree normalization.
+
+Each `PROFILE_BRANCH_*_HIER_COMBINE` line also reports `setup_seconds`, `cross_seconds`, `sort_seconds`, `reduce_seconds`, `finish_seconds`, and `total_seconds`. These are intended for bottleneck attribution only; run multiple repetitions before treating small differences as meaningful.

@@ -1,11 +1,15 @@
 use anyhow::Result;
 use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::connectivity::Connectivity;
 use crate::io::{Block, TiffStackReader};
 use crate::local_pruning::NeighborhoodComponentPruner;
-use crate::merge_tree_common::{H0Branch, H0BranchMerge, H0TreeRecorder, MergeTree};
+use crate::merge_tree_common::{
+    CompactH0BranchMerge, H0Branch, H0BranchMerge, H0PackedTreeRecorder, H0TreeRecorder, MergeTree,
+    PackedDeferredIdResolver,
+};
 use crate::slab_interface::{
     NO_INTERFACE_REP, face_node_id, interface_node_count as slab_interface_node_count,
     local_boundary_node_id,
@@ -406,6 +410,59 @@ struct GlobalPairEvent {
     b: u32,
 }
 
+#[derive(Debug, Default)]
+struct H0DeferredParentResolver {
+    watched: HashSet<u64>,
+    redirect: HashMap<u64, H0Branch>,
+}
+
+impl H0DeferredParentResolver {
+    fn from_local_events(local_by_value: &[Vec<H0BranchMerge>]) -> Self {
+        let watched = local_by_value
+            .iter()
+            .flatten()
+            .map(|event| event.parent.id)
+            .collect();
+        Self {
+            watched,
+            redirect: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_compact_local_events(local_by_value: &[Vec<CompactH0BranchMerge>]) -> Self {
+        let watched = local_by_value
+            .iter()
+            .flatten()
+            .map(|event| event.parent_id)
+            .collect();
+        Self {
+            watched,
+            redirect: HashMap::new(),
+        }
+    }
+
+    fn resolve(&self, parent: H0Branch) -> H0Branch {
+        let mut current = parent;
+        while let Some(&next) = self.redirect.get(&current.id) {
+            current = next;
+        }
+        current
+    }
+
+    fn observe_parts(&mut self, child_id: u64, parent: H0Branch) {
+        if !self.watched.contains(&child_id) {
+            return;
+        }
+        self.redirect.insert(child_id, parent);
+        self.watched.insert(parent.id);
+    }
+
+    fn observe(&mut self, merge: H0BranchMerge) {
+        self.observe_parts(merge.child.id, merge.parent);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GlobalH0MergeTreeUnionFind {
     parent: Vec<u32>,
@@ -445,6 +502,7 @@ impl GlobalH0MergeTreeUnionFind {
 
         let branch_a = self.branch[root_a as usize];
         let branch_b = self.branch[root_b as usize];
+        let same_branch = branch_a == branch_b;
         let older = branch_a.older(branch_b);
         let younger = branch_a.younger(branch_b);
 
@@ -459,11 +517,15 @@ impl GlobalH0MergeTreeUnionFind {
         }
         self.branch[root_a as usize] = older;
 
-        Some(H0BranchMerge {
-            value,
-            child: younger,
-            parent: older,
-        })
+        if same_branch {
+            None
+        } else {
+            Some(H0BranchMerge {
+                value,
+                child: younger,
+                parent: older,
+            })
+        }
     }
 
     pub(crate) fn attach(
@@ -471,18 +533,21 @@ impl GlobalH0MergeTreeUnionFind {
         interface_node: u32,
         branch: H0Branch,
         value: u16,
-    ) -> H0BranchMerge {
+    ) -> Option<H0BranchMerge> {
         let root = self.find(interface_node);
         let root_branch = self.branch[root as usize];
+        if root_branch == branch {
+            return None;
+        }
         let older = root_branch.older(branch);
         let younger = root_branch.younger(branch);
         self.branch[root as usize] = older;
 
-        H0BranchMerge {
+        Some(H0BranchMerge {
             value,
             child: younger,
             parent: older,
-        }
+        })
     }
 
     pub(crate) fn essential_branches(&mut self) -> Vec<H0Branch> {
@@ -585,16 +650,55 @@ fn generate_cross_slab_events(
     events
 }
 
-fn reduce_merge_tree(
+pub(crate) fn reduce_merge_tree(
     summaries: &[SlabH0MergeTreeSummary],
     connectivity: Connectivity,
+) -> Result<MergeTree> {
+    reduce_merge_tree_impl(summaries, connectivity, false, None)
+}
+
+pub(crate) fn reduce_merge_tree_with_deferred_parent_repair(
+    summaries: &[SlabH0MergeTreeSummary],
+    connectivity: Connectivity,
+) -> Result<MergeTree> {
+    reduce_merge_tree_impl(summaries, connectivity, true, None)
+}
+
+pub(crate) fn reduce_merge_tree_with_deferred_parent_repair_prebucketed(
+    summary: &SlabH0MergeTreeSummary,
+    compact_local_by_value: Vec<Vec<CompactH0BranchMerge>>,
+    connectivity: Connectivity,
+) -> Result<MergeTree> {
+    reduce_merge_tree_impl(
+        std::slice::from_ref(summary),
+        connectivity,
+        true,
+        Some(compact_local_by_value),
+    )
+}
+
+fn reduce_merge_tree_impl(
+    summaries: &[SlabH0MergeTreeSummary],
+    connectivity: Connectivity,
+    repair_deferred_parents: bool,
+    prebucketed_local: Option<Vec<Vec<CompactH0BranchMerge>>>,
 ) -> Result<MergeTree> {
     let offsets = build_interface_offsets(summaries);
     let branches = build_global_interface_branches(summaries, &offsets);
     let mut global_uf = GlobalH0MergeTreeUnionFind::new(branches);
 
-    let mut local_by_value: Vec<Vec<H0BranchMerge>> =
-        (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
+    let using_prebucketed_local = prebucketed_local.is_some();
+    if let Some(local_by_value) = prebucketed_local.as_ref()
+        && local_by_value.len() != NUM_U16_VALUES
+    {
+        anyhow::bail!(
+            "H0 compact prebucketed local event table has {} buckets; expected {}",
+            local_by_value.len(),
+            NUM_U16_VALUES
+        );
+    }
+    let mut local_by_value: Option<Vec<Vec<H0BranchMerge>>> =
+        (!using_prebucketed_local).then(|| (0..NUM_U16_VALUES).map(|_| Vec::new()).collect());
     let mut attach_by_value: Vec<Vec<GlobalAttachEvent>> =
         (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
     let mut interface_by_value: Vec<Vec<GlobalPairEvent>> =
@@ -603,8 +707,14 @@ fn reduce_merge_tree(
         (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
 
     for summary in summaries {
-        for &event in &summary.local_merge_events {
-            local_by_value[event.value as usize].push(event);
+        if let Some(local_by_value) = local_by_value.as_mut() {
+            for &event in &summary.local_merge_events {
+                local_by_value[event.value as usize].push(event);
+            }
+        } else if !summary.local_merge_events.is_empty() {
+            anyhow::bail!(
+                "H0 compact prebucketed reduction requires summary.local_merge_events to be empty"
+            );
         }
         for event in &summary.attach_events {
             let node = global_node_id(&offsets, summary.slab_id, event.interface_node);
@@ -628,28 +738,172 @@ fn reduce_merge_tree(
         cross_by_value[event.value as usize].push(event);
     }
 
+    if let Some(compact) = prebucketed_local.as_ref() {
+        // Hierarchical packed fast path.  Keep deferred-parent state and
+        // same-threshold plateau contraction in open-addressed integer tables
+        // instead of the HashSet+HashMap pair used by the reference reducer.
+        let mut resolver = if repair_deferred_parents {
+            let mut resolver = PackedDeferredIdResolver::default();
+            for event in compact.iter().flatten() {
+                resolver.watch(event.parent_id);
+            }
+            Some(resolver)
+        } else {
+            None
+        };
+        let mut recorder = H0PackedTreeRecorder::default();
+        let mut attach_merges: Vec<H0BranchMerge> = Vec::new();
+        let mut duplicate_targets: HashSet<(u64, u64)> = HashSet::new();
+        let mut matched_duplicates: HashSet<(u64, u64)> = HashSet::new();
+        let mut resolved_local_parent_ids: Vec<u64> = Vec::new();
+        let mut observed_global_redirects: Vec<(u64, u64)> = Vec::new();
+
+        for value in 0..NUM_U16_VALUES {
+            let value_u16 = value as u16;
+            attach_merges.clear();
+            duplicate_targets.clear();
+            matched_duplicates.clear();
+            resolved_local_parent_ids.clear();
+            observed_global_redirects.clear();
+
+            attach_merges.reserve(attach_by_value[value].len());
+            for event in &attach_by_value[value] {
+                if let Some(merge) = global_uf.attach(event.node, event.branch, value_u16) {
+                    attach_merges.push(merge);
+                }
+            }
+
+            if repair_deferred_parents {
+                duplicate_targets.extend(
+                    attach_merges
+                        .iter()
+                        .map(|merge| (merge.child.id, merge.parent.id)),
+                );
+                matched_duplicates.reserve(duplicate_targets.len());
+            }
+
+            resolved_local_parent_ids.reserve(compact[value].len());
+            for &event in &compact[value] {
+                let repaired_parent_id = if let Some(resolver) = resolver.as_ref() {
+                    resolver.resolve_id(event.parent_id)?
+                } else {
+                    event.parent_id
+                };
+
+                if !duplicate_targets.is_empty()
+                    && duplicate_targets.contains(&(event.child_id, repaired_parent_id))
+                {
+                    matched_duplicates.insert((event.child_id, repaired_parent_id));
+                }
+
+                recorder.record_compact_merge_parent_id(value_u16, event, repaired_parent_id)?;
+                resolved_local_parent_ids.push(repaired_parent_id);
+            }
+
+            for &merge in &attach_merges {
+                let duplicate_hierarchical_transition = repair_deferred_parents
+                    && matched_duplicates.contains(&(merge.child.id, merge.parent.id));
+                if !duplicate_hierarchical_transition {
+                    recorder.record_merge(merge)?;
+                    observed_global_redirects.push((merge.child.id, merge.parent.id));
+                }
+            }
+            for event in &interface_by_value[value] {
+                if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
+                    recorder.record_merge(merge)?;
+                    observed_global_redirects.push((merge.child.id, merge.parent.id));
+                }
+            }
+            for event in &cross_by_value[value] {
+                if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
+                    recorder.record_merge(merge)?;
+                    observed_global_redirects.push((merge.child.id, merge.parent.id));
+                }
+            }
+
+            recorder.finish_threshold()?;
+            if let Some(resolver) = resolver.as_mut() {
+                // Preserve threshold-delayed observation order exactly:
+                // local events first, then attach/interface/cross events.
+                for (&event, &repaired_parent_id) in
+                    compact[value].iter().zip(resolved_local_parent_ids.iter())
+                {
+                    resolver.observe(event.child_id, repaired_parent_id);
+                }
+                for &(child_id, parent_id) in &observed_global_redirects {
+                    resolver.observe(child_id, parent_id);
+                }
+            }
+        }
+
+        for branch in global_uf.essential_branches() {
+            recorder.add_essential(branch)?;
+        }
+        return recorder.into_tree();
+    }
+
+    // General reducer used by the flat/in-memory path. Keep this path
+    // unchanged as the independent reference implementation.
+    let local = local_by_value
+        .as_ref()
+        .expect("non-prebucketed H0 reducer must own local event buckets");
+    let mut resolver = if repair_deferred_parents {
+        Some(H0DeferredParentResolver::from_local_events(local))
+    } else {
+        None
+    };
     let mut recorder = H0TreeRecorder::default();
     for value in 0..NUM_U16_VALUES {
         let value_u16 = value as u16;
+        let mut observed_merges = Vec::new();
+        let mut recorded_local_merges = HashSet::new();
 
-        for &event in &local_by_value[value] {
-            recorder.record_merge(event)?;
+        {
+            let resolver_ref = resolver.as_ref();
+            for &event in &local[value] {
+                let repaired = if let Some(resolver) = resolver_ref {
+                    H0BranchMerge {
+                        parent: resolver.resolve(event.parent),
+                        ..event
+                    }
+                } else {
+                    event
+                };
+                recorder.record_merge(repaired)?;
+                recorded_local_merges.insert((repaired.child.id, repaired.parent.id));
+                observed_merges.push(repaired);
+            }
         }
+
         for event in &attach_by_value[value] {
-            recorder.record_merge(global_uf.attach(event.node, event.branch, value_u16))?;
+            if let Some(merge) = global_uf.attach(event.node, event.branch, value_u16) {
+                let duplicate_hierarchical_transition = repair_deferred_parents
+                    && recorded_local_merges.contains(&(merge.child.id, merge.parent.id));
+                if !duplicate_hierarchical_transition {
+                    recorder.record_merge(merge)?;
+                    observed_merges.push(merge);
+                }
+            }
         }
         for event in &interface_by_value[value] {
             if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
                 recorder.record_merge(merge)?;
+                observed_merges.push(merge);
             }
         }
         for event in &cross_by_value[value] {
             if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
                 recorder.record_merge(merge)?;
+                observed_merges.push(merge);
             }
         }
 
         recorder.finish_threshold()?;
+        if let Some(resolver) = resolver.as_mut() {
+            for merge in observed_merges {
+                resolver.observe(merge);
+            }
+        }
     }
 
     for branch in global_uf.essential_branches() {
@@ -676,4 +930,87 @@ pub fn compute_h0_merge_tree_zslabs(
         start.elapsed().as_secs_f64()
     );
     Ok(tree)
+}
+
+#[cfg(test)]
+mod deferred_parent_tests {
+    use super::*;
+
+    #[test]
+    fn global_h0_same_branch_replay_does_not_emit_a_second_death() {
+        let branch = H0Branch { id: 10, birth: 3 };
+        let mut uf = GlobalH0MergeTreeUnionFind::new(vec![branch, branch]);
+
+        assert!(uf.attach(0, branch, 5).is_none());
+        assert!(uf.union(0, 1, 5).is_none());
+        assert_eq!(uf.essential_branches(), vec![branch]);
+    }
+
+    #[test]
+    fn deferred_h0_parent_follows_an_earlier_global_death() {
+        let child = H0Branch { id: 10, birth: 3 };
+        let provisional_parent = H0Branch { id: 20, birth: 1 };
+        let survivor = H0Branch { id: 30, birth: 0 };
+        let local = [vec![H0BranchMerge {
+            value: 9,
+            child,
+            parent: provisional_parent,
+        }]];
+        let mut resolver = H0DeferredParentResolver::from_local_events(&local);
+
+        resolver.observe(H0BranchMerge {
+            value: 5,
+            child: provisional_parent,
+            parent: survivor,
+        });
+
+        assert_eq!(resolver.resolve(provisional_parent), survivor);
+    }
+
+    #[test]
+    fn deferred_h0_parent_compact_bucket_matches_full_bucket() {
+        let provisional_parent = H0Branch { id: 20, birth: 1 };
+        let survivor = H0Branch { id: 30, birth: 0 };
+        let compact = [vec![CompactH0BranchMerge::from_merge(H0BranchMerge {
+            value: 9,
+            child: H0Branch { id: 10, birth: 3 },
+            parent: provisional_parent,
+        })]];
+        let mut resolver = H0DeferredParentResolver::from_compact_local_events(&compact);
+
+        resolver.observe(H0BranchMerge {
+            value: 5,
+            child: provisional_parent,
+            parent: survivor,
+        });
+
+        assert_eq!(resolver.resolve(provisional_parent), survivor);
+    }
+
+    #[test]
+    fn deferred_h0_parent_follows_multiple_earlier_deaths() {
+        let child = H0Branch { id: 10, birth: 4 };
+        let first_parent = H0Branch { id: 20, birth: 2 };
+        let second_parent = H0Branch { id: 30, birth: 1 };
+        let survivor = H0Branch { id: 40, birth: 0 };
+        let local = [vec![H0BranchMerge {
+            value: 12,
+            child,
+            parent: first_parent,
+        }]];
+        let mut resolver = H0DeferredParentResolver::from_local_events(&local);
+
+        resolver.observe(H0BranchMerge {
+            value: 6,
+            child: first_parent,
+            parent: second_parent,
+        });
+        resolver.observe(H0BranchMerge {
+            value: 8,
+            child: second_parent,
+            parent: survivor,
+        });
+
+        assert_eq!(resolver.resolve(first_parent), survivor);
+    }
 }

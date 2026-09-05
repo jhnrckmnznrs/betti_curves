@@ -48,8 +48,10 @@ pub enum Mode {
     PersistenceH2ScalarHierarchicalStream,
     PersistenceH2ScalarBatchStream,
     MergeTreeH0,
+    MergeTreeH0Hierarchical,
     MergeTreeH0Stream,
     MergeTreeH2,
+    MergeTreeH2Hierarchical,
     MergeTreeH2Stream,
 }
 
@@ -115,6 +117,12 @@ pub fn parse_mode(s: &str) -> Result<Mode> {
         | "persistence-h2-scalar-batch-stream" => Ok(Mode::PersistenceH2ScalarBatchStream),
         "branch-tree-h0" | "branch_tree_h0" | "bt-h0" | "merge-tree-h0" | "merge_tree_h0"
         | "mt-h0" => Ok(Mode::MergeTreeH0),
+        "branch-tree-h0-hierarchical"
+        | "branch_tree_h0_hierarchical"
+        | "bt-h0-hierarchical"
+        | "merge-tree-h0-hierarchical"
+        | "merge_tree_h0_hierarchical"
+        | "mt-h0-hierarchical" => Ok(Mode::MergeTreeH0Hierarchical),
         "branch-tree-h0-stream"
         | "branch_tree_h0_stream"
         | "bt-h0-stream"
@@ -123,6 +131,12 @@ pub fn parse_mode(s: &str) -> Result<Mode> {
         | "mt-h0-stream" => Ok(Mode::MergeTreeH0Stream),
         "branch-tree-h2" | "branch_tree_h2" | "bt-h2" | "merge-tree-h2" | "merge_tree_h2"
         | "mt-h2" => Ok(Mode::MergeTreeH2),
+        "branch-tree-h2-hierarchical"
+        | "branch_tree_h2_hierarchical"
+        | "bt-h2-hierarchical"
+        | "merge-tree-h2-hierarchical"
+        | "merge_tree_h2_hierarchical"
+        | "mt-h2-hierarchical" => Ok(Mode::MergeTreeH2Hierarchical),
         "branch-tree-h2-stream"
         | "branch_tree_h2_stream"
         | "bt-h2-stream"
@@ -134,7 +148,7 @@ pub fn parse_mode(s: &str) -> Result<Mode> {
              event-betti0-stream, event-betti0-scalar-stream, event-betti2, \
              event-betti2-stream, event-betti2-scalar-stream, \
              h0, h0-stream, h0-scalar, h0-scalar-hierarchical, h0-scalar-hierarchical-stream, h0-scalar-stream, h0-scalar-batch, h0-scalar-batch-stream, h2, h2-stream, h2-scalar, h2-scalar-stream, h2-scalar-hierarchical-stream, h2-scalar-batch, h2-scalar-batch-stream, branch-tree-h0, \
-             branch-tree-h0-stream, branch-tree-h2, or branch-tree-h2-stream; got {:?}",
+             branch-tree-h0-hierarchical, branch-tree-h0-stream, branch-tree-h2, branch-tree-h2-hierarchical, or branch-tree-h2-stream; got {:?}",
             s
         ),
     }
@@ -153,6 +167,14 @@ mod tests {
         assert!(matches!(
             parse_mode("h2-scalar-hierarchical-stream"),
             Ok(Mode::PersistenceH2ScalarHierarchicalStream)
+        ));
+        assert!(matches!(
+            parse_mode("branch-tree-h0-hierarchical"),
+            Ok(Mode::MergeTreeH0Hierarchical)
+        ));
+        assert!(matches!(
+            parse_mode("branch-tree-h2-hierarchical"),
+            Ok(Mode::MergeTreeH2Hierarchical)
         ));
     }
 }

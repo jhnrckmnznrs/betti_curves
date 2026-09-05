@@ -4,8 +4,45 @@ All notable user-facing changes are documented here. This project follows [Seman
 
 ## [Unreleased]
 
+### Changed
+
+- Hierarchical H0/H2 branch-tree history now contracts zero-persistence finalized branches online. Already-generated stale parent references are repaired at finalization time using filtration-aware strict/equality rules, so root replay retains only positive-persistence finalized history.
+- Added profiling counters for input finalized events, contracted zero events, retained finalized events, and online parent-reference repairs.
+### Profiling instrumentation
+
+- Added coarse stage timings for hierarchical H0/H2 branch trees: parallel leaf batches, aggregate leaf I/O and compute, finalized-event bucketing, fan-in, root reduction, and plateau canonicalization.
+- Added per-combine timings for setup, cross-interface sparsification, event sorting, pairwise union-find reduction, and parent-summary construction.
+- Extended `scripts/profile_branch_tree_external.py` to aggregate the new timing counters into CSV summaries.
+- No branch-tree algorithm or event-order semantics are changed by this instrumentation pass.
+
+
+### Added
+
+- Hierarchical plateau-canonical H0/H2 branch-tree modes with online binary fan-in and bounded slab-interface reconciliation state.
+- Complete flat-vs-hierarchical branch-tree equivalence validator.
+- Source-layout policy documenting which modules are intentionally separate and which large files should be extracted later.
+
+
+### Performance
+
+- Replaced hierarchical H0/H2 fan-in concatenate-plus-stable-sort with deterministic linear merging of filtration-ordered child and cross-interface streams. H0 merges five monotone streams in `(value, Attach/Interface/Cross, left-before-right)` order. H2 logically splits mixed Outside/finite attach streams and merges seven monotone streams in `(reverse value, Outside/Attach/Interface/Cross, left-before-right)` order, preserving the former stable-sort tie semantics exactly.
+- Per-combine profiling now reports `merge_seconds`; `sort_seconds` is retained and is zero on the ordered fan-in path for direct comparison with previous profiles.
+
+- Replaced the hierarchical root reducer's hash-heavy deferred-parent and same-threshold plateau state with reusable packed open-addressed integer tables. The deferred resolver now combines watched membership and parent redirects in one table, while H0/H2 plateau contraction uses a reusable generation-stamped `u64 -> u64` map with O(1) threshold reset. The flat/in-memory reducers remain unchanged as equivalence references.
+- Hierarchical root replay now carries repaired parent IDs rather than full branch values through its scratch buffers; H2 Outside is represented by the existing `OUTSIDE_BRANCH_ID` sentinel. Branch birth metadata remains in compact events and exported nodes, so event ordering and tree semantics are unchanged.
+
+- Added a hierarchical compact root-reducer fast path for prebucketed H0/H2 events. Zero-persistence compact events are replayed directly into plateau contraction and are no longer expanded into general-purpose merge objects; full merge values are materialized only for positive-persistence branches and the much smaller global interface stream.
+- Replaced the hierarchical root reducer's all-local duplicate-transition HashSet with a target-driven check built only from actual global attach outcomes. This avoids inserting tens of millions of local branch transitions solely to suppress a small number of replay duplicates.
+- Replaced the full `observed_merges` copy of compact local history with one repaired-parent entry per local event and reused root-reduction scratch buffers across thresholds. Deferred-parent updates retain the original threshold-delayed event order.
+
+- Hierarchical finalized-event buckets now use compact H0/H2 records that omit the filtration value already encoded by the bucket index and flatten branch metadata into packed scalar fields. On 64-bit targets the compact records are asserted at 24 bytes; runtime profile lines report compact/full event sizes and estimated finalized-event storage.
+- Hierarchical H0/H2 branch-tree reduction now stores finalized branch deaths directly in `u16` filtration buckets and passes those buckets into the root reducer, eliminating the previous second full copy of finalized local events.
+- Hierarchical leaf slabs now use deterministic bounded Rayon batches. Automatic concurrency is capped at four workers and by a conservative 512 MiB concurrent-leaf budget; `BETTI_HIER_LEAF_WORKERS` and `BETTI_HIER_LEAF_BUDGET_MB` provide explicit overrides.
+- Added `scripts/profile_branch_tree_external.py` for source-instrumentation-free timing, RSS, page-fault, and hierarchy-counter sweeps.
+
 ### Fixed
 
+- Hierarchical branch-tree fan-in now separates boundary-state propagation from branch-death finalization: an older incoming H0/H2 branch can replace the elder visible on a parent boundary without killing that boundary-visible branch repeatedly at every higher fan-in level. Same-branch replay is connectivity-only, and duplicate-death diagnostics now report both competing transitions.
 - GitHub-readiness gate fixes: native-F32 H2 test widening, targeted Clippy annotations for tuning-heavy kernels, and a named hierarchical H2 combine result type.
 - Added `scripts/prepare_for_commit.sh` so local validation formats the tree before enforcing `cargo fmt --check`.
 
