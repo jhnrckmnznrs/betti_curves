@@ -1,10 +1,11 @@
 use anyhow::Result;
-use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+use crate::atomic_output::AtomicOutput;
+
 pub fn write_sparse_betti0_csv(path: &Path, results: &[(u16, i64)]) -> Result<()> {
-    let mut file = File::create(path)?;
+    let mut file = AtomicOutput::create(path)?;
 
     writeln!(file, "threshold,betti0")?;
 
@@ -12,11 +13,11 @@ pub fn write_sparse_betti0_csv(path: &Path, results: &[(u16, i64)]) -> Result<()
         writeln!(file, "{},{}", threshold, beta0)?;
     }
 
-    Ok(())
+    file.commit()
 }
 
 pub fn write_sparse_betti2_csv(path: &Path, results: &[(u16, i64)]) -> Result<()> {
-    let mut file = File::create(path)?;
+    let mut file = AtomicOutput::create(path)?;
 
     writeln!(file, "threshold,betti2")?;
 
@@ -24,7 +25,7 @@ pub fn write_sparse_betti2_csv(path: &Path, results: &[(u16, i64)]) -> Result<()
         writeln!(file, "{},{}", threshold, beta2)?;
     }
 
-    Ok(())
+    file.commit()
 }
 
 pub fn compress_changes(results: &[(u16, i64)]) -> Vec<(u16, i64)> {

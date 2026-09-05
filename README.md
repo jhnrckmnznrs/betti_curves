@@ -1,313 +1,274 @@
-# Zeroth and Second Betti Curves from TIFF Stacks
+# stream_betti_curves
 
-A Rust implementation for computing **Betti-0** and **Betti-2** curves from large 3D grayscale TIFF stacks.
+[![CI](https://github.com/jhnrckmnznrs/stream_betti_curves/actions/workflows/ci.yml/badge.svg)](https://github.com/jhnrckmnznrs/stream_betti_curves/actions/workflows/ci.yml)
+[![Benchmarks](https://github.com/jhnrckmnznrs/stream_betti_curves/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/jhnrckmnznrs/stream_betti_curves/actions/workflows/benchmarks.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-The project includes two slabwise approaches:
+**A memory-efficient parallel Rust engine for exact topological summaries of large 3-D image volumes.**
 
-- a **threshold-wise baseline**, which computes each threshold independently;
-- an **event-based algorithm**, which processes each slab once in filtration order and is substantially faster when the image contains many distinct intensity values.
+`stream_betti_curves` computes exact Betti-0 / Betti-2 curves, persistence intervals, and elder-rule branch summaries directly from grayscale TIFF stacks. It is designed for volumes that are too large to keep as one global topology problem in RAM: local slabs are reduced with union-find, interfaces are summarized, and large F32 workloads can be reconciled with disk-backed hierarchical fan-in.
 
-Both approaches use z-slab decomposition and union-find so the entire volume does not need to be stored in memory at once.
+The repository emphasizes three engineering properties:
 
-## What this computes
+- **Exactness.** Optimized paths are checked against independent or simpler reference implementations and across slab decompositions.
+- **Bounded memory.** Hierarchical H0/H2 reconciliation keeps the pairwise interface frontier bounded by the outer faces being merged instead of all slab interfaces accumulated so far.
+- **Reproducible performance.** Benchmark scripts record wall time, peak RSS, filesystem I/O, scratch usage, configuration, and persistence fingerprints.
 
-Given a grayscale 3D image stack `I(x, y, z)`, the program uses the foreground sublevel filtration
+> Repository rename note: the project is now presented as `stream_betti_curves`. The executable remains `betti_curves` for backward compatibility with existing research and validation scripts.
+
+## Measured engineering results
+
+These are **measured development results**, not theoretical projections. Historical runs predate explicit thread-count capture; the new benchmark suite records `RAYON_NUM_THREADS` so future releases can publish thread-scaling plots. Raw measurements are committed under [`benchmarks/data/`](benchmarks/data/).
+
+| Volume | Topology / algorithm | Slab | Threads | Runtime | Peak RAM | Peak scratch |
+|---|---|---:|---:|---:|---:|---:|
+| 274×274×448 (CX09T1) | H0 hierarchical + elder pruning | 8 | not recorded | 6.21 s | 15.7 MiB | — |
+| 274×274×448 (CX09T1) | H2 hierarchical + direct cross + outside pruning | 16 | not recorded | 3.54 s | 20.4 MiB | — |
+| 3792×3792×64 real F32 prefix | H0 hierarchical + elder pruning | 8 | not recorded | 546.3 s | 1.93 GiB | 3.86 GiB |
+| 3792×3792×128 real F32 prefix | H0 hierarchical + elder pruning | 8 | not recorded | 1108.0 s | 2.04 GiB | 4.22 GiB |
+
+The 64→128-slice real-volume test doubled the voxel count from 0.92 to 1.84 billion while peak RSS increased only from 1.93 to 2.04 GiB. That is the practical motivation for the hierarchical architecture.
+
+<p align="center">
+  <img src="benchmarks/plots/runtime_vs_voxels.svg" width="47%" alt="Runtime versus voxels">
+  <img src="benchmarks/plots/peak_memory_vs_voxels.svg" width="47%" alt="Peak memory versus voxels">
+</p>
+<p align="center">
+  <img src="benchmarks/plots/runtime_vs_slab_depth.svg" width="58%" alt="Runtime versus slab depth">
+</p>
+
+See [`docs/benchmarks.md`](docs/benchmarks.md) for provenance, limitations, and reproduction commands.
+
+## Architecture at a glance
+
+<p align="center">
+  <img src="docs/assets/architecture.svg" width="92%" alt="stream_betti_curves architecture">
+</p>
+
+For large F32 scalar workloads, the core pipeline is:
+
+1. read a z-slab of TIFF slices;
+2. convert scalar values to exact order-preserving keys;
+3. sweep voxels in filtration order with a compact union-find;
+4. finalize persistence pairs that can no longer be affected by neighboring slabs;
+5. export only the two surviving z-faces plus sparse connectivity events;
+6. combine adjacent summaries with an online binary fan-in;
+7. discard consumed child runs immediately;
+8. reduce the final pair directly, without materializing a whole-volume root summary.
+
+The pairwise hierarchical H0/H2 state is bounded by at most four face areas. For native F32 with packed parent/rank state, the explicit pair state is 8 bytes per interface node.
+
+Read [`docs/architecture.md`](docs/architecture.md) for the invariants, event ordering, outside-component model, and memory model.
+
+## What it computes
+
+For an image value function `I(v)`, foreground voxels enter the sublevel filtration
 
 ```text
-X_t = { (x, y, z) : I(x, y, z) <= t }
+X_t = { v : I(v) <= t }.
 ```
 
-and computes sparse step-function CSVs for:
+The engine provides:
 
-- `beta0(t)`: the number of foreground connected components;
-- `beta2(t)`: the number of enclosed background components, using dual background connectivity and outside-boundary tracking.
+- **Betti-0**: connected components of `X_t`;
+- **Betti-2**: enclosed background components under the dual background connectivity and a distinguished outside component;
+- **H0 / H2 persistence intervals**;
+- **elder-rule branch trees** for selected modes;
+- sparse Betti-curve CSVs reconstructed from persistence intervals.
 
-The background at foreground threshold `t` is
+Foreground connectivity is either 6 or 26; H2 uses the dual background connectivity (26 or 6 respectively). Persistence intervals use half-open `[birth, death)` semantics. H0 essential intervals are written with `death=inf`.
+
+## Input
+
+A volume is a directory containing one single-page grayscale TIFF per z-slice:
 
 ```text
-B_t = { (x, y, z) : I(x, y, z) > t }
+volume/
+├── slice_0000.tif
+├── slice_0001.tif
+├── slice_0002.tif
+└── ...
 ```
 
-A background component contributes to Betti-2 only if it is not connected to the outside of the image domain.
+Natural numeric filename ordering is used. All slices must have identical width, height, and pixel type.
 
-## Connectivity convention
+Scalar modes accept finite U8, U16, F32, and F64 values. F32/F64 ordering is exact with respect to the stored values; `-0.0` and `+0.0` are treated as the same filtration value and NaN/±infinity are rejected.
 
-Foreground connectivity is chosen by the user:
+## Build
 
-```text
-6   = face adjacency
-26  = face + edge + corner adjacency
-```
-
-For Betti-2, the background connectivity is chosen as the dual:
-
-```text
-foreground 6  -> background 26
-foreground 26 -> background 6
-```
-
-Background components that touch the global image boundary are treated as connected to the outside and are not counted as voids.
-
-## Input format
-
-The input is a directory of 2D grayscale TIFF slices:
-
-```text
-slices/
-  slice_0000.tif
-  slice_0001.tif
-  slice_0002.tif
-  ...
-```
-
-Filenames are sorted lexicographically, so zero-padded names should be used.
-
-Supported pixel types:
-
-- grayscale `u8`;
-- grayscale `u16`.
-
-`u8` values are promoted to `u16` internally.
-
-## Installation
-
-Install Rust, clone the repository, and build the release executable:
+Rust 1.88.0 is pinned in [`rust-toolchain.toml`](rust-toolchain.toml), and the dependency lockfile is committed.
 
 ```bash
-git clone https://github.com/jhnrckmnznrs/betti_curves.git
-cd betti_curves
-cargo build --release
+git clone https://github.com/jhnrckmnznrs/stream_betti_curves.git
+cd stream_betti_curves
+cargo build --release --locked
 ```
 
-For development checks:
-
-```bash
-cargo fmt
-cargo clippy --release -- -D warnings
-cargo test
-```
-
-## Usage
-
-```bash
-cargo run --release -- <tiff_directory> [slab_depth] [foreground_connectivity] [mode]
-```
-
-Available modes:
+The backward-compatible executable is:
 
 ```text
-betti0         threshold-wise Betti-0
-betti2         threshold-wise Betti-2
-both           threshold-wise Betti-0 and Betti-2
-event-betti0   event-based slabwise Betti-0
-event-betti2   event-based slabwise Betti-2
+target/release/betti_curves
 ```
 
-Examples:
+For development:
 
 ```bash
-cargo run --release -- ./examples/known_betti0_tiff_stack/slices 1 6 betti0
-cargo run --release -- ./examples/known_betti0_tiff_stack/slices 2 6 event-betti0
-
-cargo run --release -- ./slices 4 6 betti2
-cargo run --release -- ./slices 4 6 event-betti2
-
-cargo run --release -- ./slices 4 6 both
-cargo run --release -- ./slices 4 26 event-betti0
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
 ```
 
-Use Rayon thread control when benchmarking:
+The same checks run in GitHub Actions.
+
+## Recommended large-volume modes
+
+The code retains simple/reference implementations alongside optimized paths. For large F32 persistence workloads, the most scalable modes are:
+
+### H0
 
 ```bash
-RAYON_NUM_THREADS=4 cargo run --release -- ./slices 4 6 event-betti0
-RAYON_NUM_THREADS=4 cargo run --release -- ./slices 4 6 event-betti2
+BETTI_TEMP_DIR=/path/to/fast/scratch \
+target/release/betti_curves \
+  /path/to/slices \
+  8 26 h0-scalar-hierarchical-stream h0.csv \
+  --f32-key-mode native32 \
+  --h0-birth-buffer reuse-input \
+  --h0-event-storage direct \
+  --global-h0-uf-layout packed \
+  --h0-hier-attach-pruning elder-dominated
 ```
 
-## Output format
+### H2
 
-The program writes sparse CSV files that record only thresholds where the Betti number changes.
+```bash
+BETTI_TEMP_DIR=/path/to/fast/scratch \
+target/release/betti_curves \
+  /path/to/slices \
+  16 26 h2-scalar-hierarchical-stream h2.csv \
+  --f32-key-mode native32 \
+  --local-h2-birth-state compact \
+  --global-h2-birth-state compact \
+  --global-h2-uf-layout packed \
+  --h2-hier-cross-storage direct \
+  --h2-hier-outside-structural-pruning outside-dominated
+```
 
-Threshold-wise output:
+Slab depth is workload-dependent. Smaller slabs reduce local memory; larger slabs reduce the number of interfaces. Benchmark d8/d16/d32 on a representative prefix rather than assuming one global optimum.
+
+## Command-line families
+
+The executable intentionally keeps reference and optimized implementations in one binary:
+
+| Family | Purpose |
+|---|---|
+| `betti0`, `betti2`, `both` | simple threshold-wise curve baselines |
+| `event-betti*-stream` | disk-backed event-based Betti curves |
+| `event-betti*-scalar-stream` | exact scalar curve streams |
+| `h0-scalar-stream`, `h2-scalar-stream` | exact flat scalar persistence |
+| `h0-scalar-hierarchical-stream` | bounded-memory hierarchical H0 persistence |
+| `h2-scalar-hierarchical-stream` | outside-aware hierarchical H2 persistence |
+| `branch-tree-h0*`, `branch-tree-h2*` | elder-rule branch summaries |
+
+Run:
+
+```bash
+target/release/betti_curves --help
+```
+
+for the full set of tuning and diagnostic switches.
+
+## Correctness strategy
+
+Performance work is accepted only after exact-equivalence checks. The repository contains three levels of validation:
+
+1. **Rust unit tests** for local invariants, parsing, storage layouts, and reducers.
+2. **CLI integration tests** using committed tiny TIFF fixtures.
+3. **Independent Python oracles** for exhaustive tiny binary volumes and cross-implementation persistence checks.
+
+Release-level checks include canonical persistence-multiset hashing so output row order cannot create false failures.
+
+```bash
+python3 -m pip install -r validation/requirements.txt
+python3 validation/test_oracles.py
+scripts/check_production_release.sh /path/to/representative/stack
+```
+
+See [`docs/validation.md`](docs/validation.md) and [`validation/README.md`](validation/README.md).
+
+## Benchmarking
+
+The public benchmark harness can generate deterministic TIFF data, run Rust configurations under `/usr/bin/time -v`, run a deliberately simple Python/SciPy baseline on small volumes, and produce CSV + SVG scaling plots.
+
+```bash
+python3 -m pip install -r benchmarks/requirements.txt
+python3 benchmarks/generate_synthetic_stack.py \
+  --output /tmp/betti-128 --shape 128 128 128 --seed 42
+
+python3 benchmarks/run_suite.py \
+  /tmp/betti-128 \
+  --binary target/release/betti_curves \
+  --modes h0-scalar-stream h2-scalar-stream \
+  --slab-depths 8 16 32 \
+  --threads 1 2 4 8 \
+  --output benchmark_results.csv
+
+python3 benchmarks/plot_results.py benchmark_results.csv \
+  --output-dir benchmark_plots
+```
+
+For reproducibility from a clean checkout:
+
+```bash
+scripts/reproduce_benchmarks.sh
+```
+
+Criterion-based CLI microbenchmarks live in [`benchmarks/criterion/`](benchmarks/criterion/). Memory and filesystem I/O are measured separately because Criterion is not a memory profiler.
+
+## Performance profiling
+
+Linux flamegraph support is provided by [`scripts/profile_flamegraph.sh`](scripts/profile_flamegraph.sh). The script refuses to silently profile a debug binary and records the exact command beside the generated SVG.
+
+```bash
+cargo install flamegraph
+scripts/profile_flamegraph.sh /path/to/slices 16 26 h2-scalar-hierarchical-stream
+```
+
+See [`docs/performance-profiling.md`](docs/performance-profiling.md) for interpretation guidance and the current known hot-path categories.
+
+## Repository layout
 
 ```text
-global_betti0_curve_changes.csv
-global_betti2_curve_changes.csv
+src/                     Rust implementation
+validation/              independent correctness oracles and equivalence gates
+tests/                   end-to-end CLI integration tests
+benchmarks/              deterministic data generation, benchmark harnesses, plots
+benchmarks/criterion/    Criterion process-level microbenchmarks
+docs/                    architecture, validation, benchmarks, release documentation
+docs/development/        archived optimization investigations and experiment history
+.github/workflows/        CI, benchmark, and tagged-release automation
+scripts/                  production profiling and reproducibility helpers
 ```
 
-Event-based output:
+## Releases and versioning
 
-```text
-event_global_betti0_curve_changes.csv
-event_global_betti2_curve_changes.csv
-```
+The project follows [Semantic Versioning](https://semver.org/). The current repository-ready version is **0.2.0**. Tagged `v*` releases are configured to build and attach binaries for Linux, macOS, and Windows through GitHub Actions.
 
-Each row means that, starting at the listed threshold, the Betti number has the listed value until the next threshold row.
+See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releasing.md`](docs/releasing.md). Repository-rename steps are documented in [`docs/github-migration.md`](docs/github-migration.md).
 
-Example:
+## Contributing
 
-```csv
-threshold,betti0
-0,0
-10,1
-20,2
-30,3
-40,2
-60,1
-```
+Start with [`CONTRIBUTING.md`](CONTRIBUTING.md). Performance pull requests should include:
 
-## Algorithms
+- an exactness result against a reference path;
+- wall-time and peak-RSS measurements;
+- the benchmark command and input provenance;
+- the effective `PROFILE_CONFIG` emitted by the binary;
+- an explanation of the memory/runtime tradeoff.
 
-### Threshold-wise Betti-0
+## Related work and scope
 
-For each threshold `t`:
+The implementation shares common algorithmic ingredients with other cubical-persistence systems—union-find, local pruning, and dual foreground/background reasoning—but this repository is specifically organized around exact streaming/hierarchical summaries for large 3-D image stacks. See [`docs/related-work.md`](docs/related-work.md) for the claim boundary and literature notes.
 
-1. Read the volume one z-slab at a time.
-2. Activate voxels with `value <= t`.
-3. Compute connected components inside each slab using union-find.
-4. Store component labels on the first and last z-faces.
-5. Reconcile adjacent slabs through their z-faces.
-6. Record the global Betti-0 value.
+## License
 
-### Threshold-wise Betti-2
-
-For each foreground threshold `t`, the program computes connected components of
-
-```text
-B_t = { I > t }
-```
-
-using the dual background connectivity.
-
-The algorithm tracks whether each background component touches the global image boundary. Components connected to the outside are excluded from Betti-2.
-
-### Event-based Betti-0
-
-The event-based Betti-0 algorithm avoids recomputing the volume at every threshold.
-
-For each slab:
-
-1. Activate voxels in increasing intensity order.
-2. Create a new component for each activated voxel.
-3. Union the voxel with all already-active foreground neighbors.
-4. Record local Betti-0 changes.
-5. Record interface merge events describing when boundary components become connected inside the slab.
-6. Store interface-node information on the lower and upper z-faces.
-
-After all slabs are processed, a final global process combines local events, interface events, and cross-slab adjacencies to obtain the full-volume Betti-0 curve.
-
-### Event-based Betti-2
-
-The event-based Betti-2 algorithm processes the background superlevel filtration.
-
-For each slab:
-
-1. Activate background voxels in decreasing intensity order.
-2. Track background connected components using the dual connectivity.
-3. Track whether each component is connected to the outside.
-4. Record local changes in the number of non-outside background components.
-5. Record interface merge events and outside-connectivity events.
-6. Store interface-node information on the lower and upper z-faces.
-
-A final global process combines these slab summaries and produces the Betti-2 curve in foreground threshold order.
-
-## Parallelism
-
-The two approaches use different forms of parallelism.
-
-### Threshold-wise parallelism
-
-Each threshold is independent, so the threshold-wise algorithm parallelizes across thresholds.
-
-This is simple, but each worker rereads and reprocesses the TIFF stack for its assigned thresholds.
-
-### Event-based parallelism
-
-The filtration order is sequential, so event-based computation does not parallelize naturally across thresholds.
-
-Instead, slabs are processed independently in parallel. Their event summaries are then combined by a global reducer.
-
-Control the number of slab workers with:
-
-```bash
-RAYON_NUM_THREADS=<threads>
-```
-
-## Performance notes
-
-For the threshold-wise algorithm, runtime scales approximately as:
-
-```text
-number of unique thresholds × number of voxels
-```
-
-Random 16-bit images often contain many distinct intensity values, so the threshold-wise algorithm can be very slow.
-
-The event-based algorithm processes each voxel and its local neighbors once per slab sweep. Its dominant work is close to linear in the number of voxels, up to union-find and interface-reconciliation costs.
-
-Larger slab depths reduce the number of slab interfaces but increase memory use per worker. More Rayon threads may reduce runtime, but several slabs can be resident in memory simultaneously.
-
-Benchmark different slab depths and thread counts:
-
-```bash
-RAYON_NUM_THREADS=1 cargo run --release -- ./slices 25 6 event-betti0
-RAYON_NUM_THREADS=4 cargo run --release -- ./slices 50 6 event-betti0
-RAYON_NUM_THREADS=8 cargo run --release -- ./slices 100 6 event-betti0
-```
-
-On Linux, runtime and peak memory can be measured with:
-
-```bash
-RAYON_NUM_THREADS=4 /usr/bin/time -v \
-cargo run --release -- ./slices 100 26 event-betti0
-```
-
-The main reported quantities are:
-
-```text
-Elapsed (wall clock) time
-Maximum resident set size
-```
-
-## Validation
-
-The threshold-wise implementation is intended to serve as a correctness baseline for the event-based implementation.
-
-For a test image, compare:
-
-```bash
-cargo run --release -- ./slices 1 6 betti0
-cargo run --release -- ./slices 1 6 event-betti0
-```
-
-and:
-
-```bash
-cargo run --release -- ./slices 1 6 betti2
-cargo run --release -- ./slices 1 6 event-betti2
-```
-
-The Betti curves should agree.
-
-The output should also be invariant under valid choices of slab depth:
-
-```bash
-cargo run --release -- ./slices 1 6 event-betti0
-cargo run --release -- ./slices 2 6 event-betti0
-cargo run --release -- ./slices 4 6 event-betti0
-```
-
-## Limitations
-
-- The decomposition is based on z-slabs rather than arbitrary cropped 3D blocks.
-- TIFF files are sorted lexicographically and therefore require zero-padded filenames.
-- TIFF slices are decoded during slab reads; chunked formats such as Zarr, N5, or HDF5 may be more efficient for some workflows.
-- Increasing the number of Rayon workers can substantially increase peak memory usage.
-
-## Repository
-
-Source code:
-
-```text
-https://github.com/jhnrckmnznrs/betti_curves
-```
-
+MIT. See [`LICENSE`](LICENSE).

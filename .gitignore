@@ -1,1 +1,31 @@
-/target
+/target/
+/.venv/
+/**/__pycache__/
+*.py[cod]
+*.partial
+*.tmp
+.DS_Store
+
+# Generated release / profiling output
+/dist/
+/profiles/
+/benchmark_results*.csv
+/benchmark_plots/
+/benchmarks/criterion/target/
+
+# Research / local result products
+/*_results/
+/results/
+/*.csv
+/*.json
+/*.png
+
+# LaTeX build products
+*.aux
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.log
+*.out
+*.synctex.gz

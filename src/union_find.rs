@@ -84,6 +84,10 @@ impl DynamicUnionFind {
     }
 
     pub(crate) fn make_set(&mut self) -> u32 {
+        assert!(
+            self.parent.len() < u32::MAX as usize,
+            "DynamicUnionFind exhausted its u32 identifier space"
+        );
         let id = self.parent.len() as u32;
         self.parent.push(id);
         self.rank.push(0);
@@ -160,6 +164,10 @@ impl DynamicOutsideUnionFind {
     }
 
     pub(crate) fn make_set(&mut self, touches_outside: bool) -> u32 {
+        assert!(
+            self.parent.len() < u32::MAX as usize,
+            "DynamicOutsideUnionFind exhausted its u32 identifier space"
+        );
         let id = self.parent.len() as u32;
         self.parent.push(id);
         self.rank.push(0);

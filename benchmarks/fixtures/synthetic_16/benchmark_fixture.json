@@ -1,0 +1,11 @@
+{
+  "shape_width_height_depth": [
+    16,
+    16,
+    16
+  ],
+  "pattern": "blobs",
+  "dtype": "u8",
+  "seed": 42,
+  "generator": "benchmarks/generate_synthetic_stack.py"
+}

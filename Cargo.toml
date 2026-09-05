@@ -1,9 +1,24 @@
 [package]
-name = "betti_curves"
-version = "0.1.0"
+name = "stream_betti_curves"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88.0"
+description = "Memory-efficient Rust engine for exact Betti curves and H0/H2 persistence on large 3-D TIFF volumes"
+license = "MIT"
+repository = "https://github.com/jhnrckmnznrs/stream_betti_curves"
+
+readme = "README.md"
+keywords = ["persistent-homology", "topology", "image-processing", "hpc", "tiff"]
+categories = ["algorithms", "science"]
+
+[[bin]]
+name = "betti_curves"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
 rayon = "1.12.0"
 tiff = "0.11.3"
+
+[profile.release]
+overflow-checks = true

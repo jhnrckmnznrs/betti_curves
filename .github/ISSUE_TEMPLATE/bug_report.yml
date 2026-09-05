@@ -1,0 +1,27 @@
+name: Bug report
+description: Report an incorrect result, crash, or input-handling problem
+title: "[bug] "
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Include the exact command and error/output.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Version / commit
+      placeholder: v0.2.0 or git SHA
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Input description
+      description: Shape, TIFF type, connectivity, slab depth; do not upload sensitive/private data.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Environment
+      description: OS, Rust version, RAYON_NUM_THREADS, scratch filesystem if relevant.

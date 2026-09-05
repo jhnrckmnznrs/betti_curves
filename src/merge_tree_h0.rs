@@ -1,0 +1,679 @@
+use anyhow::Result;
+use rayon::prelude::*;
+use std::time::Instant;
+
+use crate::connectivity::Connectivity;
+use crate::io::{Block, TiffStackReader};
+use crate::local_pruning::NeighborhoodComponentPruner;
+use crate::merge_tree_common::{H0Branch, H0BranchMerge, H0TreeRecorder, MergeTree};
+use crate::slab_interface::{
+    NO_INTERFACE_REP, face_node_id, interface_node_count as slab_interface_node_count,
+    local_boundary_node_id,
+};
+
+pub(crate) const NUM_U16_VALUES: usize = 65_536;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttachEvent {
+    pub(crate) value: u16,
+    pub(crate) interface_node: u32,
+    pub(crate) branch: H0Branch,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InterfaceMergeEvent {
+    pub(crate) value: u16,
+    pub(crate) a: u32,
+    pub(crate) b: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundaryFaceNodes {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) node_ids: Vec<u32>,
+    pub(crate) values: Vec<u16>,
+    pub(crate) branch_ids: Vec<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SlabH0MergeTreeSummary {
+    pub(crate) slab_id: usize,
+    pub(crate) local_merge_events: Vec<H0BranchMerge>,
+    pub(crate) attach_events: Vec<AttachEvent>,
+    pub(crate) interface_merge_events: Vec<InterfaceMergeEvent>,
+    pub(crate) interface_node_count: u32,
+    pub(crate) z_min_face: BoundaryFaceNodes,
+    pub(crate) z_max_face: BoundaryFaceNodes,
+}
+
+#[derive(Debug)]
+struct VoxelBuckets {
+    offsets: Vec<usize>,
+    indices: Vec<u32>,
+}
+
+fn build_voxel_buckets_u16(values: &[u16]) -> VoxelBuckets {
+    let mut counts = vec![0usize; NUM_U16_VALUES];
+    for &value in values {
+        counts[value as usize] += 1;
+    }
+
+    let mut offsets = vec![0usize; NUM_U16_VALUES + 1];
+    for value in 0..NUM_U16_VALUES {
+        offsets[value + 1] = offsets[value] + counts[value];
+    }
+
+    let mut cursor = offsets.clone();
+    let mut indices = vec![0u32; values.len()];
+    for (idx, &value) in values.iter().enumerate() {
+        let position = cursor[value as usize];
+        indices[position] = idx as u32;
+        cursor[value as usize] += 1;
+    }
+
+    VoxelBuckets { offsets, indices }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LocalAction {
+    LocalMerge(H0BranchMerge),
+    Attach(AttachEvent),
+    InterfaceMerge(InterfaceMergeEvent),
+}
+
+#[derive(Debug)]
+struct LocalUnionFind {
+    parent: Vec<u32>,
+    rank: Vec<u8>,
+    branch: Vec<H0Branch>,
+    interface_rep: Vec<u32>,
+}
+
+impl LocalUnionFind {
+    fn new(block: &Block) -> Self {
+        let voxel_count = block.voxel_count();
+        assert!(
+            voxel_count <= u32::MAX as usize,
+            "LocalUnionFind uses u32 indices; slab has too many voxels"
+        );
+
+        let slice_size = block.shape[0] * block.shape[1];
+        let global_base = (block.z0 as u64)
+            .checked_mul(slice_size as u64)
+            .expect("global voxel ID overflow");
+
+        let branch = block
+            .values
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, birth)| H0Branch {
+                id: global_base + idx as u64,
+                birth,
+            })
+            .collect();
+
+        Self {
+            parent: (0..voxel_count as u32).collect(),
+            rank: vec![0u8; voxel_count],
+            branch,
+            interface_rep: vec![NO_INTERFACE_REP; voxel_count],
+        }
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            let parent = self.parent[x as usize];
+            let grandparent = self.parent[parent as usize];
+            self.parent[x as usize] = grandparent;
+            x = parent;
+        }
+        x
+    }
+
+    fn set_interface_rep(&mut self, x: u32, interface_node: u32) {
+        let root = self.find(x);
+        self.interface_rep[root as usize] = interface_node;
+    }
+
+    fn union(&mut self, a: u32, b: u32, value: u16) -> Option<LocalAction> {
+        let mut root_a = self.find(a);
+        let mut root_b = self.find(b);
+        if root_a == root_b {
+            return None;
+        }
+
+        let branch_a = self.branch[root_a as usize];
+        let branch_b = self.branch[root_b as usize];
+        let older = branch_a.older(branch_b);
+        let younger = branch_a.younger(branch_b);
+        let rep_a = self.interface_rep[root_a as usize];
+        let rep_b = self.interface_rep[root_b as usize];
+
+        let action = match (rep_a != NO_INTERFACE_REP, rep_b != NO_INTERFACE_REP) {
+            (false, false) => LocalAction::LocalMerge(H0BranchMerge {
+                value,
+                child: younger,
+                parent: older,
+            }),
+            (true, false) => LocalAction::Attach(AttachEvent {
+                value,
+                interface_node: rep_a,
+                branch: branch_b,
+            }),
+            (false, true) => LocalAction::Attach(AttachEvent {
+                value,
+                interface_node: rep_b,
+                branch: branch_a,
+            }),
+            (true, true) => LocalAction::InterfaceMerge(InterfaceMergeEvent {
+                value,
+                a: rep_a,
+                b: rep_b,
+            }),
+        };
+
+        let rank_a = self.rank[root_a as usize];
+        let rank_b = self.rank[root_b as usize];
+        if rank_a < rank_b {
+            std::mem::swap(&mut root_a, &mut root_b);
+        }
+
+        self.parent[root_b as usize] = root_a;
+        if rank_a == rank_b {
+            self.rank[root_a as usize] += 1;
+        }
+        self.branch[root_a as usize] = older;
+        self.interface_rep[root_a as usize] = if rep_a != NO_INTERFACE_REP {
+            rep_a
+        } else {
+            rep_b
+        };
+
+        Some(action)
+    }
+}
+
+struct LocalBuffers<'a> {
+    local_merge_events: &'a mut Vec<H0BranchMerge>,
+    attach_events: &'a mut Vec<AttachEvent>,
+    interface_merge_events: &'a mut Vec<InterfaceMergeEvent>,
+}
+
+fn handle_action(action: LocalAction, buffers: &mut LocalBuffers<'_>) {
+    match action {
+        LocalAction::LocalMerge(event) => buffers.local_merge_events.push(event),
+        LocalAction::Attach(event) => buffers.attach_events.push(event),
+        LocalAction::InterfaceMerge(event) => buffers.interface_merge_events.push(event),
+    }
+}
+
+fn union_active_neighbor(
+    uf: &mut LocalUnionFind,
+    active: &[u8],
+    current: u32,
+    neighbor: usize,
+    value: u16,
+    buffers: &mut LocalBuffers<'_>,
+) {
+    if active[neighbor] == 0 {
+        return;
+    }
+    if let Some(action) = uf.union(current, neighbor as u32, value) {
+        handle_action(action, buffers);
+    }
+}
+
+pub(crate) fn process_slab_h0_merge_tree(
+    slab_id: usize,
+    block: &Block,
+    connectivity: Connectivity,
+) -> SlabH0MergeTreeSummary {
+    let voxel_count = block.voxel_count();
+    let width = block.shape[0];
+    let height = block.shape[1];
+    let depth = block.shape[2];
+    let slice_size = width * height;
+
+    let mut uf = LocalUnionFind::new(block);
+    let mut active = vec![0u8; voxel_count];
+    let buckets = build_voxel_buckets_u16(&block.values);
+    let mut local_pruner = NeighborhoodComponentPruner::new(connectivity);
+
+    let interface_node_count = u32::try_from(slab_interface_node_count(slice_size, depth))
+        .expect("slab interface node count exceeds u32");
+
+    let mut local_merge_events = Vec::new();
+    let mut attach_events = Vec::new();
+    let mut interface_merge_events = Vec::new();
+
+    for value in 0..NUM_U16_VALUES {
+        let start = buckets.offsets[value];
+        let end = buckets.offsets[value + 1];
+        if start == end {
+            continue;
+        }
+        let value_u16 = value as u16;
+
+        for position in start..end {
+            let idx_u32 = buckets.indices[position];
+            let idx = idx_u32 as usize;
+            active[idx] = 1;
+
+            let face_index = idx % slice_size;
+            let z = idx / slice_size;
+            if let Some(interface_node) = local_boundary_node_id(z, depth, face_index, slice_size) {
+                uf.set_interface_rep(idx_u32, interface_node);
+            }
+
+            let x = idx % width;
+            let y = (idx / width) % height;
+            let mut buffers = LocalBuffers {
+                local_merge_events: &mut local_merge_events,
+                attach_events: &mut attach_events,
+                interface_merge_events: &mut interface_merge_events,
+            };
+
+            local_pruner.for_each_representative_neighbor(
+                &active,
+                x,
+                y,
+                z,
+                width,
+                height,
+                depth,
+                |neighbor| {
+                    union_active_neighbor(
+                        &mut uf,
+                        &active,
+                        idx_u32,
+                        neighbor,
+                        value_u16,
+                        &mut buffers,
+                    );
+                },
+            );
+        }
+    }
+
+    let z_min_face = extract_boundary_face_nodes(block, 0);
+    let z_max_face = extract_boundary_face_nodes(block, depth - 1);
+
+    SlabH0MergeTreeSummary {
+        slab_id,
+        local_merge_events,
+        attach_events,
+        interface_merge_events,
+        interface_node_count,
+        z_min_face,
+        z_max_face,
+    }
+}
+
+fn extract_boundary_face_nodes(block: &Block, z_local: usize) -> BoundaryFaceNodes {
+    let width = block.shape[0];
+    let height = block.shape[1];
+    let slice_size = width * height;
+    let mut node_ids = vec![0u32; slice_size];
+    let mut values = vec![0u16; slice_size];
+    let mut branch_ids = vec![0u64; slice_size];
+    let global_z = block.z0 + z_local;
+    let global_base = (global_z as u64)
+        .checked_mul(slice_size as u64)
+        .expect("global voxel ID overflow");
+
+    for face_idx in 0..slice_size {
+        let idx = z_local * slice_size + face_idx;
+        node_ids[face_idx] = face_node_id(z_local, block.shape[2], face_idx, slice_size);
+        values[face_idx] = block.values[idx];
+        branch_ids[face_idx] = global_base + face_idx as u64;
+    }
+
+    BoundaryFaceNodes {
+        width,
+        height,
+        node_ids,
+        values,
+        branch_ids,
+    }
+}
+
+fn make_slab_ranges(depth: usize, slab_depth: usize) -> Vec<(usize, usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut slab_id = 0usize;
+    let mut z0 = 0usize;
+    while z0 < depth {
+        let z1 = z0.saturating_add(slab_depth).min(depth);
+        ranges.push((slab_id, z0, z1));
+        slab_id += 1;
+        z0 = z1;
+    }
+    ranges
+}
+
+fn process_all_slabs(
+    volume: &TiffStackReader,
+    slab_depth: usize,
+    connectivity: Connectivity,
+) -> Result<Vec<SlabH0MergeTreeSummary>> {
+    let ranges = make_slab_ranges(volume.depth, slab_depth);
+    println!(
+        "Processing {} H0 merge-tree slab summaries in parallel...",
+        ranges.len()
+    );
+
+    let parallel_results: Vec<Result<SlabH0MergeTreeSummary>> = ranges
+        .par_iter()
+        .map(|&(slab_id, z0, z1)| {
+            let block = volume.read_z_slab(z0, z1)?;
+            Ok(process_slab_h0_merge_tree(slab_id, &block, connectivity))
+        })
+        .collect();
+
+    let mut summaries = parallel_results.into_iter().collect::<Result<Vec<_>>>()?;
+    summaries.sort_by_key(|summary| summary.slab_id);
+    Ok(summaries)
+}
+
+fn build_interface_offsets(summaries: &[SlabH0MergeTreeSummary]) -> Vec<u32> {
+    let mut offsets = Vec::with_capacity(summaries.len() + 1);
+    let mut current = 0u32;
+    offsets.push(current);
+    for summary in summaries {
+        current = current
+            .checked_add(summary.interface_node_count)
+            .expect("too many interface nodes for u32 global IDs");
+        offsets.push(current);
+    }
+    offsets
+}
+
+fn global_node_id(offsets: &[u32], slab_id: usize, local_node: u32) -> u32 {
+    offsets[slab_id] + local_node
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GlobalAttachEvent {
+    node: u32,
+    branch: H0Branch,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GlobalPairEvent {
+    value: u16,
+    a: u32,
+    b: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct GlobalH0MergeTreeUnionFind {
+    parent: Vec<u32>,
+    rank: Vec<u8>,
+    branch: Vec<H0Branch>,
+}
+
+impl GlobalH0MergeTreeUnionFind {
+    pub(crate) fn new(branch: Vec<H0Branch>) -> Self {
+        assert!(
+            branch.len() <= u32::MAX as usize,
+            "too many interface nodes for u32 IDs"
+        );
+        Self {
+            parent: (0..branch.len() as u32).collect(),
+            rank: vec![0u8; branch.len()],
+            branch,
+        }
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            let parent = self.parent[x as usize];
+            let grandparent = self.parent[parent as usize];
+            self.parent[x as usize] = grandparent;
+            x = parent;
+        }
+        x
+    }
+
+    pub(crate) fn union(&mut self, a: u32, b: u32, value: u16) -> Option<H0BranchMerge> {
+        let mut root_a = self.find(a);
+        let mut root_b = self.find(b);
+        if root_a == root_b {
+            return None;
+        }
+
+        let branch_a = self.branch[root_a as usize];
+        let branch_b = self.branch[root_b as usize];
+        let older = branch_a.older(branch_b);
+        let younger = branch_a.younger(branch_b);
+
+        let rank_a = self.rank[root_a as usize];
+        let rank_b = self.rank[root_b as usize];
+        if rank_a < rank_b {
+            std::mem::swap(&mut root_a, &mut root_b);
+        }
+        self.parent[root_b as usize] = root_a;
+        if rank_a == rank_b {
+            self.rank[root_a as usize] += 1;
+        }
+        self.branch[root_a as usize] = older;
+
+        Some(H0BranchMerge {
+            value,
+            child: younger,
+            parent: older,
+        })
+    }
+
+    pub(crate) fn attach(
+        &mut self,
+        interface_node: u32,
+        branch: H0Branch,
+        value: u16,
+    ) -> H0BranchMerge {
+        let root = self.find(interface_node);
+        let root_branch = self.branch[root as usize];
+        let older = root_branch.older(branch);
+        let younger = root_branch.younger(branch);
+        self.branch[root as usize] = older;
+
+        H0BranchMerge {
+            value,
+            child: younger,
+            parent: older,
+        }
+    }
+
+    pub(crate) fn essential_branches(&mut self) -> Vec<H0Branch> {
+        let mut branches = Vec::new();
+        for node in 0..self.parent.len() {
+            let node_u32 = node as u32;
+            if self.find(node_u32) == node_u32 {
+                branches.push(self.branch[node]);
+            }
+        }
+        branches
+    }
+}
+
+fn build_global_interface_branches(
+    summaries: &[SlabH0MergeTreeSummary],
+    offsets: &[u32],
+) -> Vec<H0Branch> {
+    let total = *offsets.last().unwrap_or(&0) as usize;
+    let mut branches = vec![H0Branch { id: 0, birth: 0 }; total];
+
+    for summary in summaries {
+        for face in [&summary.z_min_face, &summary.z_max_face] {
+            for ((&local_node, &birth), &id) in face
+                .node_ids
+                .iter()
+                .zip(face.values.iter())
+                .zip(face.branch_ids.iter())
+            {
+                let global = global_node_id(offsets, summary.slab_id, local_node) as usize;
+                branches[global] = H0Branch { id, birth };
+            }
+        }
+    }
+    branches
+}
+
+fn generate_cross_slab_events(
+    summaries: &[SlabH0MergeTreeSummary],
+    offsets: &[u32],
+    connectivity: Connectivity,
+) -> Vec<GlobalPairEvent> {
+    let mut events = Vec::new();
+
+    for slab_pair in summaries.windows(2) {
+        let left = &slab_pair[0];
+        let right = &slab_pair[1];
+        let left_face = &left.z_max_face;
+        let right_face = &right.z_min_face;
+        assert_eq!(left_face.width, right_face.width);
+        assert_eq!(left_face.height, right_face.height);
+
+        let width = left_face.width;
+        let height = left_face.height;
+        for y in 0..height {
+            for x in 0..width {
+                let left_idx = y * width + x;
+                let a = global_node_id(offsets, left.slab_id, left_face.node_ids[left_idx]);
+                let left_value = left_face.values[left_idx];
+
+                match connectivity {
+                    Connectivity::Six => {
+                        let right_idx = left_idx;
+                        let b =
+                            global_node_id(offsets, right.slab_id, right_face.node_ids[right_idx]);
+                        events.push(GlobalPairEvent {
+                            value: left_value.max(right_face.values[right_idx]),
+                            a,
+                            b,
+                        });
+                    }
+                    Connectivity::TwentySix => {
+                        for dy in -1isize..=1 {
+                            for dx in -1isize..=1 {
+                                let nx = x as isize + dx;
+                                let ny = y as isize + dy;
+                                if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize
+                                {
+                                    continue;
+                                }
+                                let right_idx = ny as usize * width + nx as usize;
+                                let b = global_node_id(
+                                    offsets,
+                                    right.slab_id,
+                                    right_face.node_ids[right_idx],
+                                );
+                                events.push(GlobalPairEvent {
+                                    value: left_value.max(right_face.values[right_idx]),
+                                    a,
+                                    b,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    events
+}
+
+fn reduce_merge_tree(
+    summaries: &[SlabH0MergeTreeSummary],
+    connectivity: Connectivity,
+) -> Result<MergeTree> {
+    let offsets = build_interface_offsets(summaries);
+    let branches = build_global_interface_branches(summaries, &offsets);
+    let mut global_uf = GlobalH0MergeTreeUnionFind::new(branches);
+
+    let mut local_by_value: Vec<Vec<H0BranchMerge>> =
+        (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
+    let mut attach_by_value: Vec<Vec<GlobalAttachEvent>> =
+        (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
+    let mut interface_by_value: Vec<Vec<GlobalPairEvent>> =
+        (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
+    let mut cross_by_value: Vec<Vec<GlobalPairEvent>> =
+        (0..NUM_U16_VALUES).map(|_| Vec::new()).collect();
+
+    for summary in summaries {
+        for &event in &summary.local_merge_events {
+            local_by_value[event.value as usize].push(event);
+        }
+        for event in &summary.attach_events {
+            let node = global_node_id(&offsets, summary.slab_id, event.interface_node);
+            attach_by_value[event.value as usize].push(GlobalAttachEvent {
+                node,
+                branch: event.branch,
+            });
+        }
+        for event in &summary.interface_merge_events {
+            let a = global_node_id(&offsets, summary.slab_id, event.a);
+            let b = global_node_id(&offsets, summary.slab_id, event.b);
+            interface_by_value[event.value as usize].push(GlobalPairEvent {
+                value: event.value,
+                a,
+                b,
+            });
+        }
+    }
+
+    for event in generate_cross_slab_events(summaries, &offsets, connectivity) {
+        cross_by_value[event.value as usize].push(event);
+    }
+
+    let mut recorder = H0TreeRecorder::default();
+    for value in 0..NUM_U16_VALUES {
+        let value_u16 = value as u16;
+
+        for &event in &local_by_value[value] {
+            recorder.record_merge(event)?;
+        }
+        for event in &attach_by_value[value] {
+            recorder.record_merge(global_uf.attach(event.node, event.branch, value_u16))?;
+        }
+        for event in &interface_by_value[value] {
+            if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
+                recorder.record_merge(merge)?;
+            }
+        }
+        for event in &cross_by_value[value] {
+            if let Some(merge) = global_uf.union(event.a, event.b, value_u16) {
+                recorder.record_merge(merge)?;
+            }
+        }
+
+        recorder.finish_threshold()?;
+    }
+
+    for branch in global_uf.essential_branches() {
+        recorder.add_essential(branch)?;
+    }
+
+    recorder.into_tree()
+}
+
+pub fn compute_h0_merge_tree_zslabs(
+    volume: &TiffStackReader,
+    slab_depth: usize,
+    connectivity: Connectivity,
+) -> Result<MergeTree> {
+    let start = Instant::now();
+    println!("Computing in-memory slabwise H0 merge tree...");
+
+    let summaries = process_all_slabs(volume, slab_depth, connectivity)?;
+    println!("Processed {} H0 merge-tree slab summaries", summaries.len());
+    let tree = reduce_merge_tree(&summaries, connectivity)?;
+
+    println!(
+        "In-memory H0 merge-tree computation took {:.3} seconds",
+        start.elapsed().as_secs_f64()
+    );
+    Ok(tree)
+}

@@ -1,0 +1,60 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 1 * *'
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-scaling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/requirements.txt
+      - run: python -m pip install -r benchmarks/requirements.txt
+      - run: cargo build --release --locked
+      - name: Generate deterministic fixture
+        run: |
+          python benchmarks/generate_synthetic_stack.py \
+            --output /tmp/stream-betti-bench \
+            --shape 64 64 64 \
+            --pattern blobs \
+            --dtype u8 \
+            --seed 42
+      - name: Run scaling benchmark
+        run: |
+          python benchmarks/run_suite.py /tmp/stream-betti-bench \
+            --binary target/release/betti_curves \
+            --modes h0-scalar-stream h2-scalar-stream \
+            --slab-depths 4 8 16 \
+            --threads 1 2 4 \
+            --repeats 1 \
+            --output benchmark_results.csv
+      - name: Compare Rust curves with naive Python baseline
+        run: |
+          python benchmarks/python_naive_baseline.py /tmp/stream-betti-bench \
+            --foreground-connectivity 26 \
+            --output-dir /tmp/python-baseline
+          target/release/betti_curves /tmp/stream-betti-bench 8 26 event-betti0-scalar-stream /tmp/rust-betti0.csv
+          target/release/betti_curves /tmp/stream-betti-bench 8 26 event-betti2-scalar-stream /tmp/rust-betti2.csv
+          python benchmarks/compare_curves.py /tmp/python-baseline/python_betti0.csv /tmp/rust-betti0.csv
+          python benchmarks/compare_curves.py /tmp/python-baseline/python_betti2.csv /tmp/rust-betti2.csv
+      - name: Plot results
+        run: python benchmarks/plot_results.py benchmark_results.csv --output-dir benchmark_plots
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-benchmark-${{ github.sha }}
+          path: |
+            benchmark_results.csv
+            benchmark_plots/

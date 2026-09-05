@@ -1,0 +1,12 @@
+[package]
+name = "stream_betti_curves_criterion"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "cli"
+harness = false

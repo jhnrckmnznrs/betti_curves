@@ -1,12 +1,18 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rayon::prelude::*;
-use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+use crate::atomic_output::AtomicOutput;
 use crate::connectivity::Connectivity;
+use crate::interface_sparsify::{InterfaceFiltration, sparsify_cross_interface};
 use crate::io::{Block, TiffStackReader};
+use crate::local_pruning::NeighborhoodComponentPruner;
+use crate::slab_interface::{
+    NO_INTERFACE_REP, face_node_id, interface_node_count as slab_interface_node_count,
+    local_boundary_node_id,
+};
 
 const NUM_U16_VALUES: usize = 65_536;
 
@@ -48,16 +54,16 @@ fn build_voxel_buckets_u16(values: &[u16]) -> VoxelBuckets {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct LocalDeltaEvent {
-    value: u16,
-    delta: i64,
+pub(crate) struct LocalDeltaEvent {
+    pub(crate) value: u16,
+    pub(crate) delta: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct InterfaceMergeEvent {
-    value: u16,
-    a: u32,
-    b: u32,
+pub(crate) struct InterfaceMergeEvent {
+    pub(crate) value: u16,
+    pub(crate) a: u32,
+    pub(crate) b: u32,
 
     /// Local effect already included in local_delta_events.
     ///
@@ -65,51 +71,51 @@ struct InterfaceMergeEvent {
     ///     nonoutside + nonoutside -> -1
     ///     outside + nonoutside    -> -1
     ///     outside + outside       ->  0
-    local_delta: i64,
+    pub(crate) local_delta: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct InterfaceOutsideEvent {
-    value: u16,
-    node: u32,
+pub(crate) struct InterfaceOutsideEvent {
+    pub(crate) value: u16,
+    pub(crate) node: u32,
 
     /// Local effect already included in local_delta_events.
     ///
     /// Usually:
     ///     0  for an outside boundary birth
     ///    -1  for a nonoutside interface component locally merging into outside
-    local_delta: i64,
+    pub(crate) local_delta: i64,
 }
 
 #[derive(Debug)]
-struct BoundaryFaceNodes {
-    width: usize,
-    height: usize,
+pub(crate) struct BoundaryFaceNodes {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
 
     /// One interface node id per face voxel.
-    node_ids: Vec<u32>,
+    pub(crate) node_ids: Vec<u32>,
 
     /// Original grayscale value of the face voxel.
-    values: Vec<u16>,
+    pub(crate) values: Vec<u16>,
 }
 
 #[derive(Debug)]
-struct SlabBetti2Summary {
-    slab_id: usize,
+pub(crate) struct SlabBetti2Summary {
+    pub(crate) slab_id: usize,
 
-    interface_node_count: u32,
+    pub(crate) interface_node_count: u32,
 
     /// Local changes to the number of background components not touching outside.
-    local_delta_events: Vec<LocalDeltaEvent>,
+    pub(crate) local_delta_events: Vec<LocalDeltaEvent>,
 
     /// Local equivalences between boundary interface nodes.
-    interface_merge_events: Vec<InterfaceMergeEvent>,
+    pub(crate) interface_merge_events: Vec<InterfaceMergeEvent>,
 
     /// Events saying an interface component becomes outside-connected locally.
-    interface_outside_events: Vec<InterfaceOutsideEvent>,
+    pub(crate) interface_outside_events: Vec<InterfaceOutsideEvent>,
 
-    z_min_face: BoundaryFaceNodes,
-    z_max_face: BoundaryFaceNodes,
+    pub(crate) z_min_face: BoundaryFaceNodes,
+    pub(crate) z_max_face: BoundaryFaceNodes,
 }
 
 #[derive(Debug)]
@@ -117,8 +123,8 @@ struct LocalBackgroundUnionFind {
     parent: Vec<u32>,
     rank: Vec<u8>,
 
-    /// For each local component root, one representative interface node if present.
-    interface_rep: Vec<Option<u32>>,
+    /// For each local root, an interface representative or NO_INTERFACE_REP.
+    interface_rep: Vec<u32>,
 
     /// Whether this local component touches the global image boundary.
     touches_outside: Vec<bool>,
@@ -141,7 +147,7 @@ impl LocalBackgroundUnionFind {
         Self {
             parent: (0..n as u32).collect(),
             rank: vec![0u8; n],
-            interface_rep: vec![None; n],
+            interface_rep: vec![NO_INTERFACE_REP; n],
             touches_outside: vec![false; n],
         }
     }
@@ -158,7 +164,7 @@ impl LocalBackgroundUnionFind {
 
     fn set_interface_rep(&mut self, x: u32, rep: u32) {
         let root = self.find(x);
-        self.interface_rep[root as usize] = Some(rep);
+        self.interface_rep[root as usize] = rep;
     }
 
     fn mark_outside(&mut self, x: u32) {
@@ -183,17 +189,21 @@ impl LocalBackgroundUnionFind {
         let local_delta = if out_a && out_b { 0 } else { -1 };
 
         let interface_merge = match (rep_a, rep_b) {
-            (Some(a_rep), Some(b_rep)) if a_rep != b_rep => Some(InterfaceMergeEvent {
-                value,
-                a: a_rep,
-                b: b_rep,
-                local_delta,
-            }),
+            (a_rep, b_rep)
+                if a_rep != NO_INTERFACE_REP && b_rep != NO_INTERFACE_REP && a_rep != b_rep =>
+            {
+                Some(InterfaceMergeEvent {
+                    value,
+                    a: a_rep,
+                    b: b_rep,
+                    local_delta,
+                })
+            }
             _ => None,
         };
 
         let outside_event = match (rep_a, rep_b) {
-            (Some(rep), None) => {
+            (rep, NO_INTERFACE_REP) if rep != NO_INTERFACE_REP => {
                 if !out_a && out_b {
                     Some(InterfaceOutsideEvent {
                         value,
@@ -204,7 +214,7 @@ impl LocalBackgroundUnionFind {
                     None
                 }
             }
-            (None, Some(rep)) => {
+            (NO_INTERFACE_REP, rep) if rep != NO_INTERFACE_REP => {
                 if out_a && !out_b {
                     Some(InterfaceOutsideEvent {
                         value,
@@ -231,7 +241,11 @@ impl LocalBackgroundUnionFind {
             self.rank[ra as usize] += 1;
         }
 
-        self.interface_rep[ra as usize] = rep_a.or(rep_b);
+        self.interface_rep[ra as usize] = if rep_a != NO_INTERFACE_REP {
+            rep_a
+        } else {
+            rep_b
+        };
         self.touches_outside[ra as usize] = out_a || out_b;
 
         Some(LocalUnionOutcome {
@@ -243,14 +257,14 @@ impl LocalBackgroundUnionFind {
 }
 
 #[derive(Debug)]
-struct GlobalOutsideUnionFind {
+pub(crate) struct GlobalOutsideUnionFind {
     parent: Vec<u32>,
     rank: Vec<u8>,
     touches_outside: Vec<bool>,
 }
 
 impl GlobalOutsideUnionFind {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         assert!(
             n <= u32::MAX as usize,
             "GlobalOutsideUnionFind uses u32 indices; too many interface nodes"
@@ -273,19 +287,19 @@ impl GlobalOutsideUnionFind {
         x
     }
 
-    fn is_outside(&mut self, x: u32) -> bool {
+    pub(crate) fn is_outside(&mut self, x: u32) -> bool {
         let root = self.find(x);
         self.touches_outside[root as usize]
     }
 
-    fn mark_outside(&mut self, x: u32) {
+    pub(crate) fn mark_outside(&mut self, x: u32) {
         let root = self.find(x);
         self.touches_outside[root as usize] = true;
     }
 
     /// Returns None if already same component.
     /// Otherwise returns Some((a_outside, b_outside)).
-    fn union(&mut self, a: u32, b: u32) -> Option<(bool, bool)> {
+    pub(crate) fn union(&mut self, a: u32, b: u32) -> Option<(bool, bool)> {
         let mut ra = self.find(a);
         let mut rb = self.find(b);
 
@@ -382,11 +396,7 @@ fn union_active_neighbor_local_background(
     }
 }
 
-fn extract_boundary_face_nodes(
-    block: &Block,
-    boundary_node_for_voxel: &[Option<u32>],
-    z_local: usize,
-) -> BoundaryFaceNodes {
+fn extract_boundary_face_nodes(block: &Block, z_local: usize) -> BoundaryFaceNodes {
     let width = block.shape[0];
     let height = block.shape[1];
     let slice_size = width * height;
@@ -399,8 +409,7 @@ fn extract_boundary_face_nodes(
             let face_idx = y * width + x;
             let idx = z_local * slice_size + y * width + x;
 
-            node_ids[face_idx] = boundary_node_for_voxel[idx]
-                .expect("every z-face voxel must have an interface node");
+            node_ids[face_idx] = face_node_id(z_local, block.shape[2], face_idx, slice_size);
             values[face_idx] = block.values[idx];
         }
     }
@@ -413,7 +422,7 @@ fn extract_boundary_face_nodes(
     }
 }
 
-fn process_slab_event_based_betti2(
+pub(crate) fn process_slab_event_based_betti2(
     slab_id: usize,
     block: &Block,
     global_width: usize,
@@ -432,24 +441,10 @@ fn process_slab_event_based_betti2(
     let mut active = vec![0u8; n];
 
     let buckets = build_voxel_buckets_u16(&block.values);
+    let mut local_pruner = NeighborhoodComponentPruner::new(background_connectivity);
 
-    // One interface node for every voxel on z_min or z_max.
-    // If depth == 1, the same voxel gets only one node.
-    let mut boundary_node_for_voxel = vec![None; n];
-    let mut interface_node_count = 0u32;
-
-    for z in [0usize, depth - 1] {
-        for y in 0..height {
-            for x in 0..width {
-                let idx = z * slice_size + y * width + x;
-
-                if boundary_node_for_voxel[idx].is_none() {
-                    boundary_node_for_voxel[idx] = Some(interface_node_count);
-                    interface_node_count += 1;
-                }
-            }
-        }
-    }
+    let interface_node_count = u32::try_from(slab_interface_node_count(slice_size, depth))
+        .expect("slab interface node count exceeds u32");
 
     let mut local_delta_events = Vec::new();
     let mut interface_merge_events = Vec::new();
@@ -477,7 +472,8 @@ fn process_slab_event_based_betti2(
             let y = (idx / width) % height;
             let z = idx / slice_size;
 
-            if let Some(interface_node) = boundary_node_for_voxel[idx] {
+            let face_index = idx % slice_size;
+            if let Some(interface_node) = local_boundary_node_id(z, depth, face_index, slice_size) {
                 uf.set_interface_rep(idx_u32, interface_node);
             }
 
@@ -494,7 +490,9 @@ fn process_slab_event_based_betti2(
             if touches_outside {
                 uf.mark_outside(idx_u32);
 
-                if let Some(interface_node) = boundary_node_for_voxel[idx] {
+                if let Some(interface_node) =
+                    local_boundary_node_id(z, depth, face_index, slice_size)
+                {
                     interface_outside_events.push(InterfaceOutsideEvent {
                         value: value_u16,
                         node: interface_node,
@@ -512,135 +510,25 @@ fn process_slab_event_based_betti2(
                 interface_outside_events: &mut interface_outside_events,
             };
 
-            match background_connectivity {
-                Connectivity::Six => {
-                    // -x
-                    if x > 0 {
-                        let neighbor = idx - 1;
-
-                        union_active_neighbor_local_background(
-                            &mut uf,
-                            &active,
-                            idx_u32,
-                            neighbor,
-                            value_u16,
-                            &mut event_buffers,
-                        );
-                    }
-
-                    // +x
-                    if x + 1 < width {
-                        let neighbor = idx + 1;
-
-                        union_active_neighbor_local_background(
-                            &mut uf,
-                            &active,
-                            idx_u32,
-                            neighbor,
-                            value_u16,
-                            &mut event_buffers,
-                        );
-                    }
-
-                    // -y
-                    if y > 0 {
-                        let neighbor = idx - width;
-
-                        union_active_neighbor_local_background(
-                            &mut uf,
-                            &active,
-                            idx_u32,
-                            neighbor,
-                            value_u16,
-                            &mut event_buffers,
-                        );
-                    }
-
-                    // +y
-                    if y + 1 < height {
-                        let neighbor = idx + width;
-
-                        union_active_neighbor_local_background(
-                            &mut uf,
-                            &active,
-                            idx_u32,
-                            neighbor,
-                            value_u16,
-                            &mut event_buffers,
-                        );
-                    }
-
-                    // -z
-                    if z > 0 {
-                        let neighbor = idx - slice_size;
-
-                        union_active_neighbor_local_background(
-                            &mut uf,
-                            &active,
-                            idx_u32,
-                            neighbor,
-                            value_u16,
-                            &mut event_buffers,
-                        );
-                    }
-
-                    // +z
-                    if z + 1 < depth {
-                        let neighbor = idx + slice_size;
-
-                        union_active_neighbor_local_background(
-                            &mut uf,
-                            &active,
-                            idx_u32,
-                            neighbor,
-                            value_u16,
-                            &mut event_buffers,
-                        );
-                    }
-                }
-
-                Connectivity::TwentySix => {
-                    for dz in -1isize..=1 {
-                        for dy in -1isize..=1 {
-                            for dx in -1isize..=1 {
-                                if dx == 0 && dy == 0 && dz == 0 {
-                                    continue;
-                                }
-
-                                let nx = x as isize + dx;
-                                let ny = y as isize + dy;
-                                let nz = z as isize + dz;
-
-                                // Perform this check before converting to usize.
-                                if nx < 0
-                                    || ny < 0
-                                    || nz < 0
-                                    || nx >= width as isize
-                                    || ny >= height as isize
-                                    || nz >= depth as isize
-                                {
-                                    continue;
-                                }
-
-                                let nx = nx as usize;
-                                let ny = ny as usize;
-                                let nz = nz as usize;
-
-                                let neighbor = nz * slice_size + ny * width + nx;
-
-                                union_active_neighbor_local_background(
-                                    &mut uf,
-                                    &active,
-                                    idx_u32,
-                                    neighbor,
-                                    value_u16,
-                                    &mut event_buffers,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            local_pruner.for_each_representative_neighbor(
+                &active,
+                x,
+                y,
+                z,
+                width,
+                height,
+                depth,
+                |neighbor| {
+                    union_active_neighbor_local_background(
+                        &mut uf,
+                        &active,
+                        idx_u32,
+                        neighbor,
+                        value_u16,
+                        &mut event_buffers,
+                    );
+                },
+            );
         }
 
         if delta != 0 {
@@ -651,8 +539,8 @@ fn process_slab_event_based_betti2(
         }
     }
 
-    let z_min_face = extract_boundary_face_nodes(block, &boundary_node_for_voxel, 0);
-    let z_max_face = extract_boundary_face_nodes(block, &boundary_node_for_voxel, depth - 1);
+    let z_min_face = extract_boundary_face_nodes(block, 0);
+    let z_max_face = extract_boundary_face_nodes(block, depth - 1);
 
     SlabBetti2Summary {
         slab_id,
@@ -672,7 +560,7 @@ fn make_slab_ranges(depth: usize, slab_depth: usize) -> Vec<(usize, usize, usize
     let mut z0 = 0usize;
 
     while z0 < depth {
-        let z1 = usize::min(z0 + slab_depth, depth);
+        let z1 = z0.saturating_add(slab_depth).min(depth);
         ranges.push((slab_id, z0, z1));
 
         z0 = z1;
@@ -722,41 +610,6 @@ fn process_all_slabs_event_based_betti2(
     Ok(summaries)
 }
 
-// fn process_all_slabs_event_based_betti2(
-//     volume: &TiffStackReader,
-//     slab_depth: usize,
-//     background_connectivity: Connectivity,
-// ) -> Result<Vec<SlabBetti2Summary>> {
-//     let [global_width, global_height, global_depth] = volume.shape();
-
-//     let mut summaries = Vec::new();
-
-//     let mut slab_id = 0usize;
-//     let mut z0 = 0usize;
-
-//     while z0 < volume.depth {
-//         let z1 = usize::min(z0 + slab_depth, volume.depth);
-
-//         let block = volume.read_z_slab(z0, z1)?;
-
-//         let summary = process_slab_event_based_betti2(
-//             slab_id,
-//             &block,
-//             global_width,
-//             global_height,
-//             global_depth,
-//             background_connectivity,
-//         );
-
-//         summaries.push(summary);
-
-//         z0 = z1;
-//         slab_id += 1;
-//     }
-
-//     Ok(summaries)
-// }
-
 fn build_interface_offsets(summaries: &[SlabBetti2Summary]) -> Vec<u32> {
     let mut offsets = Vec::with_capacity(summaries.len() + 1);
     let mut current = 0u32;
@@ -777,116 +630,11 @@ fn global_node_id(interface_offsets: &[u32], slab_id: usize, local_node_id: u32)
     interface_offsets[slab_id] + local_node_id
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CrossSlabEdge {
-    value: u16,
-    a_global: u32,
-    b_global: u32,
-}
-
-fn generate_cross_slab_edges(
-    summaries: &[SlabBetti2Summary],
-    interface_offsets: &[u32],
-    background_connectivity: Connectivity,
-) -> Vec<CrossSlabEdge> {
-    let mut edges = Vec::new();
-
-    if summaries.len() < 2 {
-        return edges;
-    }
-
-    for k in 0..summaries.len() - 1 {
-        let left = &summaries[k];
-        let right = &summaries[k + 1];
-
-        let left_face = &left.z_max_face;
-        let right_face = &right.z_min_face;
-
-        assert_eq!(left_face.width, right_face.width);
-        assert_eq!(left_face.height, right_face.height);
-
-        let width = left_face.width;
-        let height = left_face.height;
-
-        for y in 0..height {
-            for x in 0..width {
-                let i_left = y * width + x;
-
-                let left_local_node = left_face.node_ids[i_left];
-                let left_value = left_face.values[i_left];
-
-                match background_connectivity {
-                    Connectivity::Six => {
-                        let i_right = y * width + x;
-
-                        let right_local_node = right_face.node_ids[i_right];
-                        let right_value = right_face.values[i_right];
-
-                        // Background superlevel edge appears at min().
-                        let value = left_value.min(right_value);
-
-                        edges.push(CrossSlabEdge {
-                            value,
-                            a_global: global_node_id(
-                                interface_offsets,
-                                left.slab_id,
-                                left_local_node,
-                            ),
-                            b_global: global_node_id(
-                                interface_offsets,
-                                right.slab_id,
-                                right_local_node,
-                            ),
-                        });
-                    }
-
-                    Connectivity::TwentySix => {
-                        for dy in -1isize..=1 {
-                            for dx in -1isize..=1 {
-                                let nx = x as isize + dx;
-                                let ny = y as isize + dy;
-
-                                if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize
-                                {
-                                    continue;
-                                }
-
-                                let i_right = ny as usize * width + nx as usize;
-
-                                let right_local_node = right_face.node_ids[i_right];
-                                let right_value = right_face.values[i_right];
-
-                                let value = left_value.min(right_value);
-
-                                edges.push(CrossSlabEdge {
-                                    value,
-                                    a_global: global_node_id(
-                                        interface_offsets,
-                                        left.slab_id,
-                                        left_local_node,
-                                    ),
-                                    b_global: global_node_id(
-                                        interface_offsets,
-                                        right.slab_id,
-                                        right_local_node,
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    edges
-}
-
 fn reduce_event_based_betti2(
     summaries: &[SlabBetti2Summary],
     background_connectivity: Connectivity,
     max_value: u16,
-) -> Vec<(u16, i64)> {
+) -> Result<Vec<(u16, i64)>> {
     let interface_offsets = build_interface_offsets(summaries);
     let total_interface_nodes = *interface_offsets.last().unwrap_or(&0) as usize;
 
@@ -917,11 +665,48 @@ fn reduce_event_based_betti2(
         }
     }
 
-    let cross_edges =
-        generate_cross_slab_edges(summaries, &interface_offsets, background_connectivity);
+    if summaries.len() >= 2 {
+        for pair_id in 0..summaries.len() - 1 {
+            let left = &summaries[pair_id];
+            let right = &summaries[pair_id + 1];
+            let left_face = &left.z_max_face;
+            let right_face = &right.z_min_face;
 
-    for edge in cross_edges {
-        cross_edges_by_value[edge.value as usize].push((edge.a_global, edge.b_global));
+            assert_eq!(left_face.width, right_face.width);
+            assert_eq!(left_face.height, right_face.height);
+
+            let stats = sparsify_cross_interface(
+                &left_face.values,
+                &right_face.values,
+                left_face.width,
+                left_face.height,
+                background_connectivity,
+                InterfaceFiltration::SuperlevelMin,
+                |edge| {
+                    let left_index = edge.left_face_index as usize;
+                    let right_index = edge.right_face_index as usize;
+
+                    let a = global_node_id(
+                        &interface_offsets,
+                        left.slab_id,
+                        left_face.node_ids[left_index],
+                    );
+                    let b = global_node_id(
+                        &interface_offsets,
+                        right.slab_id,
+                        right_face.node_ids[right_index],
+                    );
+
+                    cross_edges_by_value[edge.value as usize].push((a, b));
+                    Ok(())
+                },
+            )?;
+
+            println!(
+                "Betti-2 interface {pair_id}: retained {} of {} cross edges",
+                stats.retained_edges, stats.candidate_edges
+            );
+        }
     }
 
     // dense_betti2[t] = beta2 for foreground threshold t.
@@ -958,7 +743,7 @@ fn reduce_event_based_betti2(
                         global_uf.mark_outside(node);
                     }
                 }
-                _ => panic!("unexpected outside event local_delta: {}", local_delta),
+                _ => bail!("unexpected outside event local_delta: {local_delta}"),
             }
         }
 
@@ -1010,7 +795,7 @@ fn reduce_event_based_betti2(
         }
     }
 
-    sparse_curve
+    Ok(sparse_curve)
 }
 
 pub fn compute_event_based_betti2_zslabs(
@@ -1040,7 +825,7 @@ pub fn compute_event_based_betti2_zslabs(
 
     let mut z0 = 0usize;
     while z0 < volume.depth {
-        let z1 = usize::min(z0 + slab_depth, volume.depth);
+        let z1 = z0.saturating_add(slab_depth).min(volume.depth);
         let block = volume.read_z_slab(z0, z1)?;
 
         if let Some(block_max) = block.values.iter().copied().max() {
@@ -1050,7 +835,7 @@ pub fn compute_event_based_betti2_zslabs(
         z0 = z1;
     }
 
-    let curve = reduce_event_based_betti2(&summaries, background_connectivity, actual_max);
+    let curve = reduce_event_based_betti2(&summaries, background_connectivity, actual_max)?;
 
     println!(
         "Event-based slabwise Betti-2 computation took {:.3} seconds",
@@ -1061,7 +846,7 @@ pub fn compute_event_based_betti2_zslabs(
 }
 
 pub fn write_event_betti2_csv(path: &Path, curve: &[(u16, i64)]) -> Result<()> {
-    let mut file = File::create(path)?;
+    let mut file = AtomicOutput::create(path)?;
 
     writeln!(file, "threshold,betti2")?;
 
@@ -1069,5 +854,24 @@ pub fn write_event_betti2_csv(path: &Path, curve: &[(u16, i64)]) -> Result<()> {
         writeln!(file, "{},{}", threshold, beta2)?;
     }
 
-    Ok(())
+    file.commit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interior_components_never_emit_the_no_representative_sentinel() {
+        let mut uf = LocalBackgroundUnionFind::new(2);
+        uf.mark_outside(1);
+
+        let outcome = uf
+            .union_with_events(0, 1, 7)
+            .expect("the two singleton components must merge");
+
+        assert_eq!(outcome.local_delta, -1);
+        assert!(outcome.interface_merge.is_none());
+        assert!(outcome.outside_event.is_none());
+    }
 }

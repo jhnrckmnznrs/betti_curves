@@ -303,7 +303,7 @@ fn compute_betti2_threshold_zslabs(
     let mut z0 = 0usize;
 
     while z0 < volume.depth {
-        let z1 = usize::min(z0 + slab_depth, volume.depth);
+        let z1 = z0.saturating_add(slab_depth).min(volume.depth);
 
         if verbose {
             println!(
@@ -414,4 +414,36 @@ pub fn compute_sparse_betti2_curve_parallel(
     );
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shell_block() -> Block {
+        let mut values = vec![1u16; 27];
+        values[13] = 4;
+        Block {
+            z0: 0,
+            shape: [3, 3, 3],
+            values,
+        }
+    }
+
+    #[test]
+    fn shell_uses_strict_background_superlevel_and_excludes_outside() {
+        let block = shell_block();
+
+        for connectivity in [Connectivity::Six, Connectivity::TwentySix] {
+            let enclosed =
+                process_background_slab_at_threshold(0, &block, 1, 3, 3, 3, connectivity);
+            assert_eq!(
+                enclosed.local_components - enclosed.local_outside_components,
+                1
+            );
+
+            let filled = process_background_slab_at_threshold(0, &block, 4, 3, 3, 3, connectivity);
+            assert_eq!(filled.local_components - filled.local_outside_components, 0);
+        }
+    }
 }

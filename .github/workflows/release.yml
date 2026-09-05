@@ -1,0 +1,55 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+            exe: betti_curves
+          - os: macos-latest
+            artifact: macos-arm64
+            exe: betti_curves
+          - os: windows-latest
+            artifact: windows-x86_64
+            exe: betti_curves.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets --locked
+      - run: cargo build --release --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Package binary
+        run: python scripts/package_binary.py --binary target/release/${{ matrix.exe }} --label ${{ matrix.artifact }} --version ${{ github.ref_name }} --output-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-artifacts/*

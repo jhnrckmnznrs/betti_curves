@@ -265,7 +265,7 @@ fn compute_global_betti0_threshold_zslabs(
     let mut z0 = 0usize;
 
     while z0 < depth {
-        let z1 = usize::min(z0 + slab_depth, depth);
+        let z1 = z0.saturating_add(slab_depth).min(depth);
 
         if verbose {
             println!(
@@ -360,4 +360,28 @@ pub fn compute_sparse_global_betti0_parallel(
     );
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagonal_voxels_distinguish_six_and_twenty_six_connectivity() {
+        let mut values = vec![5u16; 27];
+        values[0] = 1;
+        values[13] = 1;
+        values[26] = 1;
+        let block = Block {
+            z0: 0,
+            shape: [3, 3, 3],
+            values,
+        };
+
+        let six = process_slab_at_threshold(0, &block, 1, Connectivity::Six);
+        let twenty_six = process_slab_at_threshold(0, &block, 1, Connectivity::TwentySix);
+
+        assert_eq!(six.local_beta0, 3);
+        assert_eq!(twenty_six.local_beta0, 1);
+    }
 }

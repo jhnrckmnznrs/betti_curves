@@ -1,8 +1,35 @@
 use anyhow::{Context, Result, bail};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use tiff::ColorType;
 use tiff::decoder::{Decoder, DecodingResult};
+
+use crate::tiff_paths::list_tiff_slices;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegerPixelType {
+    U8,
+    U16,
+}
+
+impl std::fmt::Display for IntegerPixelType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::U8 => "U8",
+            Self::U16 => "U16",
+        })
+    }
+}
+
+impl IntegerPixelType {
+    fn bits_per_sample(self) -> u8 {
+        match self {
+            Self::U8 => 8,
+            Self::U16 => 16,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TiffStackReader {
@@ -10,6 +37,7 @@ pub struct TiffStackReader {
     pub width: usize,
     pub height: usize,
     pub depth: usize,
+    pub pixel_type: IntegerPixelType,
 }
 
 #[derive(Debug)]
@@ -17,11 +45,11 @@ pub struct Block {
     /// Global starting z-index of this slab.
     pub z0: usize,
 
-    /// shape = [width, height, depth] of this block/slab.
+    /// `shape = [width, height, depth]` of this block/slab.
     pub shape: [usize; 3],
 
     /// Layout:
-    /// values[z_local * width * height + y_local * width + x_local]
+    /// `values[z_local * width * height + y_local * width + x_local]`
     pub values: Vec<u16>,
 }
 
@@ -35,14 +63,14 @@ impl TiffStackReader {
     pub fn open(dir: &Path) -> Result<Self> {
         let paths = list_tiff_slices(dir)?;
 
-        let (width, height, _) = read_tiff_u16(&paths[0])
+        let (width, height, pixel_type, _) = read_tiff_u16(&paths[0])
             .with_context(|| format!("Failed to read first slice {:?}", paths[0]))?;
 
         println!("Found {} TIFF slices", paths.len());
         println!("First slice dimensions: {} x {}", width, height);
 
         for path in &paths {
-            let (w, h) = read_tiff_dimensions(path)
+            let (w, h, color_type) = read_tiff_dimensions(path)
                 .with_context(|| format!("Failed to read dimensions for {:?}", path))?;
 
             if w != width || h != height {
@@ -55,15 +83,27 @@ impl TiffStackReader {
                     height
                 );
             }
+            if color_type != ColorType::Gray(pixel_type.bits_per_sample()) {
+                bail!(
+                    "mixed TIFF pixel types are not supported: {:?} is {color_type:?}, expected grayscale {}",
+                    path,
+                    pixel_type
+                );
+            }
         }
 
         let depth = paths.len();
+        width
+            .checked_mul(height)
+            .and_then(|slice| slice.checked_mul(depth))
+            .ok_or_else(|| anyhow::anyhow!("TIFF stack dimensions overflow usize"))?;
 
         Ok(Self {
             paths,
             width,
             height,
             depth,
+            pixel_type,
         })
     }
 
@@ -86,15 +126,28 @@ impl TiffStackReader {
         }
 
         let slab_depth = z1 - z0;
-        let slice_size = self.width * self.height;
-        let mut values = Vec::with_capacity(slice_size * slab_depth);
+        let slice_size = self
+            .width
+            .checked_mul(self.height)
+            .ok_or_else(|| anyhow::anyhow!("TIFF slice size overflow"))?;
+        let capacity = slice_size
+            .checked_mul(slab_depth)
+            .ok_or_else(|| anyhow::anyhow!("TIFF slab size overflow"))?;
+        let mut values = Vec::with_capacity(capacity);
 
         for z in z0..z1 {
-            let (w, h, slice) = read_tiff_u16(&self.paths[z])
+            let (w, h, pixel_type, slice) = read_tiff_u16(&self.paths[z])
                 .with_context(|| format!("Failed to read slice {:?}", self.paths[z]))?;
 
             if w != self.width || h != self.height {
                 bail!("Slice {:?} has wrong shape", self.paths[z]);
+            }
+            if pixel_type != self.pixel_type {
+                bail!(
+                    "mixed TIFF pixel types are not supported: {:?} is {pixel_type}, expected {}",
+                    self.paths[z],
+                    self.pixel_type
+                );
             }
 
             values.extend_from_slice(&slice);
@@ -118,7 +171,7 @@ pub fn collect_unique_values_by_slabs(
     let mut z0 = 0usize;
 
     while z0 < volume.depth {
-        let z1 = usize::min(z0 + slab_depth, volume.depth);
+        let z1 = z0.saturating_add(slab_depth).min(volume.depth);
 
         if verbose {
             println!("Scanning values in slab z={}..{}", z0, z1);
@@ -148,6 +201,7 @@ pub fn print_volume_info(volume: &TiffStackReader) {
     println!("=== Virtual 3D volume ===");
     println!("shape: {} x {} x {}", w, h, d);
     println!("voxel count: {}", volume.voxel_count());
+    println!("source pixel type: {}", volume.pixel_type);
     println!(
         "raw u16 volume size: {}",
         human_bytes(volume.raw_u16_bytes() as u64)
@@ -174,32 +228,29 @@ pub fn print_volume_info(volume: &TiffStackReader) {
     println!();
 }
 
-fn list_tiff_slices(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = fs::read_dir(dir)
-        .with_context(|| format!("Could not read directory {:?}", dir))?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|e| e.to_str())
-                .map(|ext| {
-                    let ext = ext.to_ascii_lowercase();
-                    ext == "tif" || ext == "tiff"
-                })
-                .unwrap_or(false)
-        })
-        .collect();
+fn read_tiff_dimensions(path: &Path) -> Result<(usize, usize, ColorType)> {
+    let file = File::open(path).with_context(|| format!("Could not open TIFF file {:?}", path))?;
+    let reader = BufReader::new(file);
+    let mut decoder = Decoder::new(reader)
+        .with_context(|| format!("Could not create TIFF decoder for {:?}", path))?;
 
-    files.sort();
-
-    if files.is_empty() {
-        bail!("No .tif or .tiff files found in {:?}", dir);
+    let (width, height) = decoder
+        .dimensions()
+        .with_context(|| format!("Could not read dimensions for {:?}", path))?;
+    let color_type = decoder
+        .colortype()
+        .with_context(|| format!("Could not read TIFF color type for {path:?}"))?;
+    if !matches!(color_type, ColorType::Gray(_)) {
+        bail!("{path:?} is {color_type:?}; only one-channel grayscale TIFF slices are supported");
+    }
+    if decoder.more_images() {
+        bail!("{path:?} contains more than one TIFF page; supply one single-page file per z-slice");
     }
 
-    Ok(files)
+    Ok((width as usize, height as usize, color_type))
 }
 
-fn read_tiff_dimensions(path: &Path) -> Result<(usize, usize)> {
+fn read_tiff_u16(path: &Path) -> Result<(usize, usize, IntegerPixelType, Vec<u16>)> {
     let file = File::open(path).with_context(|| format!("Could not open TIFF file {:?}", path))?;
     let reader = BufReader::new(file);
     let mut decoder = Decoder::new(reader)
@@ -208,25 +259,18 @@ fn read_tiff_dimensions(path: &Path) -> Result<(usize, usize)> {
     let (width, height) = decoder
         .dimensions()
         .with_context(|| format!("Could not read dimensions for {:?}", path))?;
-
-    Ok((width as usize, height as usize))
-}
-
-fn read_tiff_u16(path: &Path) -> Result<(usize, usize, Vec<u16>)> {
-    let file = File::open(path).with_context(|| format!("Could not open TIFF file {:?}", path))?;
-    let reader = BufReader::new(file);
-    let mut decoder = Decoder::new(reader)
-        .with_context(|| format!("Could not create TIFF decoder for {:?}", path))?;
-
-    let (width, height) = decoder
-        .dimensions()
-        .with_context(|| format!("Could not read dimensions for {:?}", path))?;
+    let color_type = decoder
+        .colortype()
+        .with_context(|| format!("Could not read TIFF color type for {path:?}"))?;
+    if !matches!(color_type, ColorType::Gray(_)) {
+        bail!("{path:?} is {color_type:?}; only one-channel grayscale TIFF slices are supported");
+    }
 
     let image = decoder
         .read_image()
         .with_context(|| format!("Could not decode TIFF image {:?}", path))?;
 
-    match image {
+    let result = match image {
         DecodingResult::U16(data) => {
             let expected = width as usize * height as usize;
             if data.len() != expected {
@@ -237,7 +281,7 @@ fn read_tiff_u16(path: &Path) -> Result<(usize, usize, Vec<u16>)> {
                     expected
                 );
             }
-            Ok((width as usize, height as usize, data))
+            (IntegerPixelType::U16, data)
         }
         DecodingResult::U8(data) => {
             let expected = width as usize * height as usize;
@@ -251,16 +295,21 @@ fn read_tiff_u16(path: &Path) -> Result<(usize, usize, Vec<u16>)> {
             }
 
             let data_u16: Vec<u16> = data.into_iter().map(u16::from).collect();
-            Ok((width as usize, height as usize, data_u16))
+            (IntegerPixelType::U8, data_u16)
         }
         other => {
             bail!(
-                "Unsupported TIFF pixel type in {:?}: {:?}. This demo supports grayscale U8 and U16.",
+                "unsupported TIFF pixel type in {:?}: {:?}. Integer modes support grayscale U8 and U16",
                 path,
                 other
             );
         }
+    };
+
+    if decoder.more_images() {
+        bail!("{path:?} contains more than one TIFF page; supply one single-page file per z-slice");
     }
+    Ok((width as usize, height as usize, result.0, result.1))
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -274,4 +323,77 @@ fn human_bytes(bytes: u64) -> String {
     }
 
     format!("{:.2} {}", size, units[unit])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tiff::encoder::{TiffEncoder, colortype};
+
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_directory(label: &str) -> PathBuf {
+        let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "betti_io_{label}_{}_{}",
+            std::process::id(),
+            sequence
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path).unwrap();
+        }
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn rejects_rgb_slices() {
+        let directory = test_directory("rgb");
+        let path = directory.join("slice_0.tif");
+        let file = File::create(&path).unwrap();
+        let mut encoder = TiffEncoder::new(file).unwrap();
+        encoder
+            .write_image::<colortype::RGB8>(1, 1, &[1, 2, 3])
+            .unwrap();
+
+        let error = TiffStackReader::open(&directory).unwrap_err();
+        assert!(format!("{error:#}").contains("one-channel grayscale"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_multi_page_slices() {
+        let directory = test_directory("multipage");
+        let path = directory.join("slice_0.tif");
+        let file = File::create(&path).unwrap();
+        let mut encoder = TiffEncoder::new(file).unwrap();
+        encoder.write_image::<colortype::Gray8>(1, 1, &[1]).unwrap();
+        encoder.write_image::<colortype::Gray8>(1, 1, &[2]).unwrap();
+
+        let error = TiffStackReader::open(&directory).unwrap_err();
+        assert!(format!("{error:#}").contains("more than one TIFF page"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_mixed_integer_pixel_types_before_slab_processing() {
+        let directory = test_directory("mixed");
+        {
+            let file = File::create(directory.join("slice_0.tif")).unwrap();
+            let mut encoder = TiffEncoder::new(file).unwrap();
+            encoder.write_image::<colortype::Gray8>(1, 1, &[1]).unwrap();
+        }
+        {
+            let file = File::create(directory.join("slice_1.tif")).unwrap();
+            let mut encoder = TiffEncoder::new(file).unwrap();
+            encoder
+                .write_image::<colortype::Gray16>(1, 1, &[2])
+                .unwrap();
+        }
+
+        let error = TiffStackReader::open(&directory).unwrap_err();
+        assert!(error.to_string().contains("mixed TIFF pixel types"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

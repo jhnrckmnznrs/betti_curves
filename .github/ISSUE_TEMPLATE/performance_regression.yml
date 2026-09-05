@@ -1,0 +1,28 @@
+name: Performance regression
+description: Report a reproducible runtime, memory, or I/O regression
+title: "[performance] "
+labels: [performance]
+body:
+  - type: input
+    attributes:
+      label: Before / after versions
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Benchmark command
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Input and environment
+      description: Shape/type, threads, slab depth, connectivity, CPU/RAM, scratch filesystem.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Measurements
+      description: Wall time, peak RSS, system time, filesystem inputs/outputs, canonical hash if applicable.
+    validations:
+      required: true

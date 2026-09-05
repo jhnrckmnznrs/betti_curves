@@ -1,0 +1,9 @@
+dataset,shape,voxels,homology,algorithm,slab_depth,threads,runtime_s,peak_ram_mib,scratch_gib,intervals,source
+CX09T1,274x274x448,33634048,H0,hierarchical + elder pruning,8,not recorded,6.2122340540081495,15.71484375,,122087,cx09t1_h0_attach_pruning.csv
+CX09T1,274x274x448,33634048,H0,hierarchical + elder pruning,16,not recorded,5.711419786995975,22.5625,,122087,cx09t1_h0_attach_pruning.csv
+CX09T1,274x274x448,33634048,H0,hierarchical + elder pruning,32,not recorded,5.55531692400109,37.12109375,,122087,cx09t1_h0_attach_pruning.csv
+CX09T1,274x274x448,33634048,H2,hierarchical + direct cross + outside pruning,8,not recorded,3.81,14.34765625,,220093,cx09t1_h2_outside_structural_pruning_summary.csv
+CX09T1,274x274x448,33634048,H2,hierarchical + direct cross + outside pruning,16,not recorded,3.54,20.42578125,,220093,cx09t1_h2_outside_structural_pruning_summary.csv
+CX09T1,274x274x448,33634048,H2,hierarchical + direct cross + outside pruning,32,not recorded,4.57,33.5703125,,220093,cx09t1_h2_outside_structural_pruning_summary.csv
+T1_S26 prefix 64z,3792x3792x64,920272896,H0,hierarchical + elder pruning,8,not recorded,546.25415079901,1978.15234375,3.857071503996849,5919883,t1_s26_h0_real_prefix.csv
+T1_S26 prefix 128z,3792x3792x128,1840545792,H0,hierarchical + elder pruning,8,not recorded,1108.0197868179966,2088.2578125,4.219758711755276,11668672,t1_s26_h0_real_prefix.csv

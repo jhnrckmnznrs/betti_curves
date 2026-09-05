@@ -1,0 +1,27 @@
+digraph G {
+  rankdir=LR;
+  graph [fontname="Helvetica", nodesep=0.45, ranksep=0.65, bgcolor="transparent"];
+  node [shape=box, style="rounded", fontname="Helvetica", fontsize=11];
+  edge [fontname="Helvetica", fontsize=10];
+
+  input [label="TIFF z-slices"];
+  slab [label="Slab reader\n+ exact scalar keys"];
+  local [label="Local filtration sweep\nunion-find + pruning"];
+  pairs [label="Finalized\npersistence pairs"];
+  summary [label="Two z-faces\n+ sparse events"];
+  fanin [label="Online binary fan-in"];
+  pairuf [label="Pairwise reducer\n≤ 4 face areas"];
+  output [label="CSV / Betti curves\n/ branch summaries"];
+  scratch [shape=cylinder, label="Scratch runs\n(BETTI_TEMP_DIR)"];
+
+  input -> slab -> local;
+  local -> pairs;
+  local -> summary;
+  summary -> fanin -> pairuf;
+  pairuf -> pairs;
+  pairuf -> fanin [label="parent summary"];
+  pairs -> output;
+  local -> scratch [style=dashed];
+  pairuf -> scratch [style=dashed];
+  scratch -> fanin [style=dashed];
+}
