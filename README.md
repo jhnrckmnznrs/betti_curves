@@ -155,6 +155,14 @@ target/release/betti_curves \
 
 Slab depth is workload-dependent. Smaller slabs reduce local memory; larger slabs reduce the number of interfaces. Benchmark d8/d16/d32 on a representative prefix rather than assuming one global optimum.
 
+The experimental integer branch-tree leaf reducer now uses compact packed UF state and a local elder-voxel ID instead of storing a full branch object at every voxel. It also uses the interior linear-offset neighborhood kernel already validated in the scalar path. The design goal is to make deeper leaves (especially d16/d32) cheap enough to fuse several former slabs at source, cutting seam reconciliation and repeated interface-tree replay rather than widening the upper hierarchy. See [`docs/compact-branch-tree-leaf-state.md`](docs/compact-branch-tree-leaf-state.md).
+
+The experimental leaf-history fast path also keeps finalized local deaths in slab-local IDs and uses an exact one-bit watch filter before consulting the sparse provisional-parent map. On workloads where almost all leaf deaths have zero persistence, this turns the common history-contraction path into a bit test plus discard. Set `BETTI_HIER_LEAF_HISTORY_WATCH_FILTER=0` to disable the watch shortcut for A/B profiling. See [`docs/leaf-history-watch-filter.md`](docs/leaf-history-watch-filter.md).
+
+The plateau-native leaf fast path goes one step earlier: a finite local branch born and killed at the current threshold is discarded at the union decision, so the zero-persistence history record is never constructed. Sequential activation is deliberately retained because the exact neighborhood pruner depends on it; interface/attach/Outside transitions are not suppressed. Set `BETTI_HIER_PLATEAU_NATIVE_LEAF=0` to restore the v15 behavior. See [`docs/plateau-native-leaf-elision.md`](docs/plateau-native-leaf-elision.md).
+
+An opt-in leaf-kernel audit (`BETTI_HIER_LEAF_KERNEL_AUDIT=1`) reports exact neighborhood-pruning and union-find event counts plus sparse timing samples, without changing the v16 algorithm. It is intended to decide whether the next optimization should remove representative edges, specialize union-find, or reduce interface bookkeeping. See [`docs/leaf-kernel-audit.md`](docs/leaf-kernel-audit.md).
+
 ## Command-line families
 
 The executable intentionally keeps reference and optimized implementations in one binary:
@@ -282,3 +290,9 @@ MIT. See [`LICENSE`](LICENSE).
 ### Experimental recursive branch-history contraction
 
 The hierarchical branch-tree implementation can contract zero-persistence finalized history at every fan-in node before the summary is propagated upward. This extends leaf-local history contraction and is intended to keep root history close to the final branch-tree scale. Set `BETTI_HIER_RECURSIVE_HISTORY=0` to restore the v11 internal-history behavior for A/B validation. See `docs/hierarchical-recursive-history-contraction.md`.
+
+### H2 exact root deduplication
+
+The frozen v18 H2 leaf kernel keeps one active neighbor per pre-existing union-find root before union/action processing. Root deduplication is exact, allocation-free (fixed stack buffer), and enabled by default. It removes cycle edges that would otherwise become already-connected no-op unions without changing filtration order or branch-parent semantics. Set `BETTI_HIER_H2_ROOT_DEDUP=0` only for same-binary reference/ablation runs.
+
+The v18 lazy 3x3x3 shell-component pruner is retained only as an **opt-in experimental ablation** because the measured extra shell-state traffic outweighed its reduction in UF work on CX09T1. Enable it explicitly with `BETTI_HIER_H2_SHELL_PRUNE=1`. With `BETTI_HIER_LEAF_KERNEL_AUDIT=1`, the profile reports `shell_*` and `root_dedup_*` counters. See `docs/h2-root-dedup-freeze.md` for the freeze decision and benchmark evidence.

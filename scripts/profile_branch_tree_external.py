@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """External profiler for stream_betti_curves hierarchical branch trees.
 
-No Rust source instrumentation is required. Runs the existing release binary
-under /usr/bin/time -v, sweeps slab depths, parses the program's existing
-PROFILE_BRANCH_* lines, and writes raw + median-summary CSV files.
+Runs the release binary under /usr/bin/time -v, sweeps slab depths, parses
+PROFILE_BRANCH_* lines, and writes raw + median-summary CSV files. Normal
+profiling needs no extra instrumentation; when BETTI_HIER_LEAF_KERNEL_AUDIT=1
+the optional v17 leaf-kernel counters and sampled timings are parsed as well.
 """
 
 from __future__ import annotations
@@ -100,11 +101,15 @@ def run_one(args: argparse.Namespace, dim: str, depth: int, repeat: int) -> dict
         upper = dim.upper()
         hierarchy_prefix = f"PROFILE_BRANCH_{upper}_HIERARCHY "
         combine_prefix = f"PROFILE_BRANCH_{upper}_HIER_COMBINE "
+        leaf_state_prefix = f"PROFILE_BRANCH_{upper}_LEAF_STATE "
+        leaf_kernel_prefix = f"PROFILE_BRANCH_{upper}_LEAF_KERNEL_AUDIT "
         compute_re = re.compile(
             rf"Hierarchical {upper} branch-tree computation took ([0-9.]+) seconds"
         )
 
         hierarchy = {}
+        leaf_state = {}
+        leaf_kernel = {}
         combines = []
         compute_seconds = None
 
@@ -113,6 +118,10 @@ def run_one(args: argparse.Namespace, dim: str, depth: int, repeat: int) -> dict
                 hierarchy = parse_kv(line[len(hierarchy_prefix):])
             elif line.startswith(combine_prefix):
                 combines.append(parse_kv(line[len(combine_prefix):]))
+            elif line.startswith(leaf_state_prefix):
+                leaf_state = parse_kv(line[len(leaf_state_prefix):])
+            elif line.startswith(leaf_kernel_prefix):
+                leaf_kernel = parse_kv(line[len(leaf_kernel_prefix):])
             else:
                 m = compute_re.search(line)
                 if m:
@@ -139,6 +148,55 @@ def run_one(args: argparse.Namespace, dim: str, depth: int, repeat: int) -> dict
                 row[k] = int(v)
             except ValueError:
                 row[k] = v
+
+        for k, v in leaf_state.items():
+            key = f"leaf_state_{k}"
+            try:
+                row[key] = int(v)
+            except ValueError:
+                row[key] = v
+
+        for k, v in leaf_kernel.items():
+            key = f"leaf_kernel_{k}"
+            try:
+                row[key] = int(v)
+            except ValueError:
+                row[key] = v
+
+        # Derived audit ratios stay in the raw CSV so they can be inspected per run.
+        audit_attempts = int(row.get("leaf_kernel_union_attempts", 0))
+        audit_successes = int(row.get("leaf_kernel_union_successes", 0))
+        audit_reps = int(row.get("leaf_kernel_representative_neighbors", 0))
+        audit_active_hits = int(row.get("leaf_kernel_active_neighbor_hits", 0))
+        audit_checks = int(row.get("leaf_kernel_active_state_checks", 0))
+        audit_find_calls = int(row.get("leaf_kernel_find_calls", 0))
+        audit_find_hops = int(row.get("leaf_kernel_find_parent_hops", 0))
+        audit_cache_lookups = int(row.get("leaf_kernel_pruner_cache_lookups", 0))
+        audit_cache_hits = int(row.get("leaf_kernel_pruner_cache_hits", 0))
+        audit_samples = int(row.get("leaf_kernel_timing_samples", 0))
+        row["leaf_kernel_union_success_fraction"] = (audit_successes / audit_attempts) if audit_attempts else 0.0
+        row["leaf_kernel_representative_per_active_hit"] = (audit_reps / audit_active_hits) if audit_active_hits else 0.0
+        row["leaf_kernel_active_hit_fraction"] = (audit_active_hits / audit_checks) if audit_checks else 0.0
+        row["leaf_kernel_mean_find_hops"] = (audit_find_hops / audit_find_calls) if audit_find_calls else 0.0
+        row["leaf_kernel_pruner_cache_hit_fraction"] = (audit_cache_hits / audit_cache_lookups) if audit_cache_lookups else 0.0
+        shell_hits = int(row.get("leaf_kernel_shell_active_face_hits", 0))
+        shell_reps = int(row.get("leaf_kernel_shell_representatives", 0))
+        dedup_inputs = int(row.get("leaf_kernel_root_dedup_inputs", 0))
+        dedup_skipped = int(row.get("leaf_kernel_root_dedup_skipped", 0))
+        row["leaf_kernel_shell_representative_per_active_face"] = (shell_reps / shell_hits) if shell_hits else 0.0
+        row["leaf_kernel_root_dedup_skip_fraction"] = (dedup_skipped / dedup_inputs) if dedup_inputs else 0.0
+        row["leaf_kernel_sample_activation_bookkeeping_ns_per_voxel"] = (
+            int(row.get("leaf_kernel_activation_bookkeeping_sample_ns", 0)) / audit_samples
+            if audit_samples else 0.0
+        )
+        row["leaf_kernel_sample_neighbor_pruning_ns_per_voxel"] = (
+            int(row.get("leaf_kernel_neighbor_pruning_sample_ns", 0)) / audit_samples
+            if audit_samples else 0.0
+        )
+        row["leaf_kernel_sample_union_action_ns_per_voxel"] = (
+            int(row.get("leaf_kernel_union_action_sample_ns", 0)) / audit_samples
+            if audit_samples else 0.0
+        )
 
         integer_combine_fields = (
             "pair_nodes",
@@ -255,13 +313,63 @@ def main() -> int:
                 "median_minor_faults": med(group, "minor_faults"),
                 "median_major_faults": med(group, "major_faults"),
                 "median_max_pair_nodes": med(group, "max_pair_nodes"),
+                "median_leaf_state_nodes": med(group, "leaf_state_nodes"),
+                "median_leaf_state_total_mb": med(group, "leaf_state_total_bytes") / (1024.0 * 1024.0),
+                "median_leaf_kernel_activations": med(group, "leaf_kernel_activations"),
+                "median_leaf_kernel_interior_voxels": med(group, "leaf_kernel_interior_voxels"),
+                "median_leaf_kernel_boundary_voxels": med(group, "leaf_kernel_boundary_voxels"),
+                "median_leaf_kernel_active_state_checks": med(group, "leaf_kernel_active_state_checks"),
+                "median_leaf_kernel_active_neighbor_hits": med(group, "leaf_kernel_active_neighbor_hits"),
+                "median_leaf_kernel_representative_neighbors": med(group, "leaf_kernel_representative_neighbors"),
+                "median_leaf_kernel_pruner_cache_lookups": med(group, "leaf_kernel_pruner_cache_lookups"),
+                "median_leaf_kernel_pruner_cache_hits": med(group, "leaf_kernel_pruner_cache_hits"),
+                "median_leaf_kernel_pruner_cache_misses": med(group, "leaf_kernel_pruner_cache_misses"),
+                "median_leaf_kernel_pruner_mask_computations": med(group, "leaf_kernel_pruner_mask_computations"),
+                "median_leaf_kernel_union_attempts": med(group, "leaf_kernel_union_attempts"),
+                "median_leaf_kernel_union_successes": med(group, "leaf_kernel_union_successes"),
+                "median_leaf_kernel_union_already_connected": med(group, "leaf_kernel_union_already_connected"),
+                "median_leaf_kernel_union_local_local": med(group, "leaf_kernel_union_local_local"),
+                "median_leaf_kernel_union_boundary_internal": med(group, "leaf_kernel_union_boundary_internal"),
+                "median_leaf_kernel_union_interface_interface": med(group, "leaf_kernel_union_interface_interface"),
+                "median_leaf_kernel_union_outside_involved": med(group, "leaf_kernel_union_outside_involved"),
+                "median_leaf_kernel_current_root_reused": med(group, "leaf_kernel_current_root_reused"),
+                "median_leaf_kernel_current_root_refinds": med(group, "leaf_kernel_current_root_refinds"),
+                "median_leaf_kernel_find_calls": med(group, "leaf_kernel_find_calls"),
+                "median_leaf_kernel_find_parent_hops": med(group, "leaf_kernel_find_parent_hops"),
+                "median_leaf_kernel_find_max_hops": med(group, "leaf_kernel_find_max_hops"),
+                "median_leaf_kernel_shell_face_checks": med(group, "leaf_kernel_shell_face_checks"),
+                "median_leaf_kernel_shell_active_face_hits": med(group, "leaf_kernel_shell_active_face_hits"),
+                "median_leaf_kernel_shell_extra_state_checks": med(group, "leaf_kernel_shell_extra_state_checks"),
+                "median_leaf_kernel_shell_extra_active_hits": med(group, "leaf_kernel_shell_extra_active_hits"),
+                "median_leaf_kernel_shell_representatives": med(group, "leaf_kernel_shell_representatives"),
+                "median_leaf_kernel_root_dedup_inputs": med(group, "leaf_kernel_root_dedup_inputs"),
+                "median_leaf_kernel_root_dedup_unique": med(group, "leaf_kernel_root_dedup_unique"),
+                "median_leaf_kernel_root_dedup_skipped": med(group, "leaf_kernel_root_dedup_skipped"),
+                "median_leaf_kernel_timing_samples": med(group, "leaf_kernel_timing_samples"),
+                "median_leaf_kernel_bucket_build_ms": med(group, "leaf_kernel_bucket_build_ns") / 1_000_000.0,
+                "median_leaf_kernel_union_success_fraction": med(group, "leaf_kernel_union_success_fraction"),
+                "median_leaf_kernel_representative_per_active_hit": med(group, "leaf_kernel_representative_per_active_hit"),
+                "median_leaf_kernel_active_hit_fraction": med(group, "leaf_kernel_active_hit_fraction"),
+                "median_leaf_kernel_mean_find_hops": med(group, "leaf_kernel_mean_find_hops"),
+                "median_leaf_kernel_pruner_cache_hit_fraction": med(group, "leaf_kernel_pruner_cache_hit_fraction"),
+                "median_leaf_kernel_shell_representative_per_active_face": med(group, "leaf_kernel_shell_representative_per_active_face"),
+                "median_leaf_kernel_root_dedup_skip_fraction": med(group, "leaf_kernel_root_dedup_skip_fraction"),
+                "median_leaf_kernel_sample_activation_bookkeeping_ns_per_voxel": med(group, "leaf_kernel_sample_activation_bookkeeping_ns_per_voxel"),
+                "median_leaf_kernel_sample_neighbor_pruning_ns_per_voxel": med(group, "leaf_kernel_sample_neighbor_pruning_ns_per_voxel"),
+                "median_leaf_kernel_sample_union_action_ns_per_voxel": med(group, "leaf_kernel_sample_union_action_ns_per_voxel"),
                 "median_leaf_one_boundary_internal": med(group, "leaf_one_boundary_internal"),
                 "median_leaf_finalized_attach_early": med(group, "leaf_finalized_attach_early"),
                 "median_leaf_propagated_attach": med(group, "leaf_propagated_attach"),
                 "median_leaf_local_history_input_events": med(group, "leaf_local_history_input_events"),
+                "median_leaf_local_history_materialized_events": med(group, "leaf_local_history_materialized_events"),
                 "median_leaf_local_history_retained_events": med(group, "leaf_local_history_retained_events"),
                 "median_leaf_local_history_contracted_zero_events": med(group, "leaf_local_history_contracted_zero_events"),
                 "median_leaf_local_history_repaired_parent_refs": med(group, "leaf_local_history_repaired_parent_refs"),
+                "median_leaf_local_history_parent_watch_checks": med(group, "leaf_local_history_parent_watch_checks"),
+                "median_leaf_local_history_parent_lookup_skips": med(group, "leaf_local_history_parent_lookup_skips"),
+                "median_leaf_local_history_parent_hash_lookups": med(group, "leaf_local_history_parent_hash_lookups"),
+                "median_leaf_local_history_zero_fast_drops": med(group, "leaf_local_history_zero_fast_drops"),
+                "median_leaf_plateau_zero_local_merges_elided": med(group, "leaf_plateau_zero_local_merges_elided"),
                 "median_recursive_history_nodes": med(group, "recursive_history_nodes"),
                 "median_recursive_history_input_events": med(group, "recursive_history_input_events"),
                 "median_recursive_history_retained_events": med(group, "recursive_history_retained_events"),

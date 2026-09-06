@@ -71,7 +71,7 @@ fn slab_ranges(depth: usize, slab_depth: usize) -> Vec<(usize, usize, usize)> {
 
 const NUM_U16_VALUES: usize = 65_536;
 const DEFAULT_HIER_LEAF_MEMORY_BUDGET_MB: usize = 512;
-const ESTIMATED_HIER_LEAF_BYTES_PER_VOXEL: usize = 128;
+const ESTIMATED_HIER_LEAF_BYTES_PER_VOXEL: usize = 48;
 const DEFAULT_MAX_HIER_LEAF_WORKERS: usize = 4;
 
 fn materialized_fan_in_reference_enabled() -> bool {
@@ -100,6 +100,47 @@ fn inline_leaf_history_contraction_enabled() -> bool {
                 "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
             )
         })
+}
+
+fn leaf_history_watch_filter_enabled() -> bool {
+    !std::env::var("BETTI_HIER_LEAF_HISTORY_WATCH_FILTER")
+        .ok()
+        .is_some_and(|raw| {
+            matches!(
+                raw.as_str(),
+                "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+            )
+        })
+}
+
+fn plateau_native_leaf_enabled() -> bool {
+    !std::env::var("BETTI_HIER_PLATEAU_NATIVE_LEAF")
+        .ok()
+        .is_some_and(|raw| {
+            matches!(
+                raw.as_str(),
+                "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+            )
+        })
+}
+
+fn leaf_kernel_audit_enabled() -> bool {
+    std::env::var("BETTI_HIER_LEAF_KERNEL_AUDIT")
+        .ok()
+        .is_some_and(|raw| {
+            matches!(
+                raw.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+}
+
+fn leaf_kernel_audit_sample_stride() -> u64 {
+    std::env::var("BETTI_HIER_LEAF_AUDIT_SAMPLE_STRIDE")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|&stride| stride > 0)
+        .unwrap_or(4096)
 }
 
 fn recursive_history_contraction_enabled() -> bool {
@@ -1975,6 +2016,8 @@ pub fn compute_h0_merge_tree_hierarchical_zslabs(
     let mut root_combine_seconds = 0.0f64;
     let early_finalize_leaf_attaches = early_finalize_leaf_attaches_enabled();
     let inline_leaf_history = inline_leaf_history_contraction_enabled();
+    let leaf_history_watch_filter = leaf_history_watch_filter_enabled();
+    let plateau_native_leaf = plateau_native_leaf_enabled() && inline_leaf_history;
     let recursive_history = recursive_history_contraction_enabled();
     let mut recursive_history_stats = RecursiveHistoryStats::default();
     let mut leaf_attach_stats = H0LeafAttachStats::default();
@@ -2016,12 +2059,81 @@ pub fn compute_h0_merge_tree_hierarchical_zslabs(
             leaf_attach_stats.finalized_early += attach_stats.finalized_early;
             leaf_attach_stats.propagated_attach += attach_stats.propagated_attach;
             leaf_attach_stats.local_history_input_events += attach_stats.local_history_input_events;
+            leaf_attach_stats.local_history_materialized_events +=
+                attach_stats.local_history_materialized_events;
             leaf_attach_stats.local_history_retained_events +=
                 attach_stats.local_history_retained_events;
             leaf_attach_stats.local_history_contracted_zero_events +=
                 attach_stats.local_history_contracted_zero_events;
             leaf_attach_stats.local_history_repaired_parent_refs +=
                 attach_stats.local_history_repaired_parent_refs;
+            leaf_attach_stats.local_history_parent_watch_checks +=
+                attach_stats.local_history_parent_watch_checks;
+            leaf_attach_stats.local_history_parent_lookup_skips +=
+                attach_stats.local_history_parent_lookup_skips;
+            leaf_attach_stats.local_history_parent_hash_lookups +=
+                attach_stats.local_history_parent_hash_lookups;
+            leaf_attach_stats.local_history_zero_fast_drops +=
+                attach_stats.local_history_zero_fast_drops;
+            leaf_attach_stats.plateau_zero_local_merges_elided +=
+                attach_stats.plateau_zero_local_merges_elided;
+            leaf_attach_stats.kernel_audit_activations += attach_stats.kernel_audit_activations;
+            leaf_attach_stats.kernel_audit_interior_voxels +=
+                attach_stats.kernel_audit_interior_voxels;
+            leaf_attach_stats.kernel_audit_boundary_voxels +=
+                attach_stats.kernel_audit_boundary_voxels;
+            leaf_attach_stats.kernel_audit_interface_activations +=
+                attach_stats.kernel_audit_interface_activations;
+            leaf_attach_stats.kernel_audit_global_boundary_activations +=
+                attach_stats.kernel_audit_global_boundary_activations;
+            leaf_attach_stats.kernel_audit_active_state_checks +=
+                attach_stats.kernel_audit_active_state_checks;
+            leaf_attach_stats.kernel_audit_active_neighbor_hits +=
+                attach_stats.kernel_audit_active_neighbor_hits;
+            leaf_attach_stats.kernel_audit_representative_neighbors +=
+                attach_stats.kernel_audit_representative_neighbors;
+            leaf_attach_stats.kernel_audit_pruner_cache_lookups +=
+                attach_stats.kernel_audit_pruner_cache_lookups;
+            leaf_attach_stats.kernel_audit_pruner_cache_hits +=
+                attach_stats.kernel_audit_pruner_cache_hits;
+            leaf_attach_stats.kernel_audit_pruner_cache_misses +=
+                attach_stats.kernel_audit_pruner_cache_misses;
+            leaf_attach_stats.kernel_audit_pruner_mask_computations +=
+                attach_stats.kernel_audit_pruner_mask_computations;
+            leaf_attach_stats.kernel_audit_union_attempts +=
+                attach_stats.kernel_audit_union_attempts;
+            leaf_attach_stats.kernel_audit_union_successes +=
+                attach_stats.kernel_audit_union_successes;
+            leaf_attach_stats.kernel_audit_union_already_connected +=
+                attach_stats.kernel_audit_union_already_connected;
+            leaf_attach_stats.kernel_audit_union_local_local +=
+                attach_stats.kernel_audit_union_local_local;
+            leaf_attach_stats.kernel_audit_union_boundary_internal +=
+                attach_stats.kernel_audit_union_boundary_internal;
+            leaf_attach_stats.kernel_audit_union_interface_interface +=
+                attach_stats.kernel_audit_union_interface_interface;
+            leaf_attach_stats.kernel_audit_union_outside_involved +=
+                attach_stats.kernel_audit_union_outside_involved;
+            leaf_attach_stats.kernel_audit_current_root_reused +=
+                attach_stats.kernel_audit_current_root_reused;
+            leaf_attach_stats.kernel_audit_current_root_refinds +=
+                attach_stats.kernel_audit_current_root_refinds;
+            leaf_attach_stats.kernel_audit_find_calls += attach_stats.kernel_audit_find_calls;
+            leaf_attach_stats.kernel_audit_find_parent_hops +=
+                attach_stats.kernel_audit_find_parent_hops;
+            leaf_attach_stats.kernel_audit_find_max_hops = leaf_attach_stats
+                .kernel_audit_find_max_hops
+                .max(attach_stats.kernel_audit_find_max_hops);
+            leaf_attach_stats.kernel_audit_timing_samples +=
+                attach_stats.kernel_audit_timing_samples;
+            leaf_attach_stats.kernel_audit_activation_bookkeeping_sample_ns +=
+                attach_stats.kernel_audit_activation_bookkeeping_sample_ns;
+            leaf_attach_stats.kernel_audit_neighbor_pruning_sample_ns +=
+                attach_stats.kernel_audit_neighbor_pruning_sample_ns;
+            leaf_attach_stats.kernel_audit_union_action_sample_ns +=
+                attach_stats.kernel_audit_union_action_sample_ns;
+            leaf_attach_stats.kernel_audit_bucket_build_ns +=
+                attach_stats.kernel_audit_bucket_build_ns;
             leaf_read_thread_seconds += read_seconds;
             leaf_compute_thread_seconds += compute_seconds;
             if !recursive_history {
@@ -2117,7 +2229,7 @@ pub fn compute_h0_merge_tree_hierarchical_zslabs(
     let tree = canonicalize_h0_plateaus(raw_tree)?;
     let canonical_seconds = canonical_start.elapsed().as_secs_f64();
     println!(
-        "PROFILE_BRANCH_H0_HIERARCHY leaf_slabs={} leaf_workers={} combines={} max_live_summaries={} max_pair_nodes={} final_interface_nodes={} leaf_attach_policy={} leaf_history_policy={} recursive_history_policy={} leaf_one_boundary_internal={} leaf_finalized_attach_early={} leaf_propagated_attach={} leaf_local_history_input_events={} leaf_local_history_retained_events={} leaf_local_history_contracted_zero_events={} leaf_local_history_repaired_parent_refs={} recursive_history_nodes={} recursive_history_input_events={} recursive_history_retained_events={} recursive_history_contracted_zero_events={} recursive_history_repaired_parent_refs={} central_history_input_events={} finalized_input_events={} finalized_events={} contracted_zero_events={} repaired_history_parent_refs={} compact_event_bytes={} full_event_bytes={} finalized_storage_bytes={} leaf_batch_seconds={:.6} leaf_read_thread_seconds={:.6} leaf_compute_thread_seconds={:.6} bucket_seconds={:.6} fan_in_seconds={:.6} root_combine_seconds={:.6} root_reduce_seconds={:.6} canonical_seconds={:.6} canonical_parenting=plateau",
+        "PROFILE_BRANCH_H0_HIERARCHY leaf_state_layout=packed-local-id leaf_neighbor_kernel=interior-fast leaf_worker_est_bytes_per_voxel=48 leaf_slabs={} leaf_workers={} combines={} max_live_summaries={} max_pair_nodes={} final_interface_nodes={} leaf_attach_policy={} leaf_history_policy={} leaf_history_watch_filter={} plateau_native_leaf={} recursive_history_policy={} leaf_one_boundary_internal={} leaf_finalized_attach_early={} leaf_propagated_attach={} leaf_local_history_input_events={} leaf_local_history_materialized_events={} leaf_local_history_retained_events={} leaf_local_history_contracted_zero_events={} leaf_local_history_repaired_parent_refs={} leaf_local_history_parent_watch_checks={} leaf_local_history_parent_lookup_skips={} leaf_local_history_parent_hash_lookups={} leaf_local_history_zero_fast_drops={} leaf_plateau_zero_local_merges_elided={} recursive_history_nodes={} recursive_history_input_events={} recursive_history_retained_events={} recursive_history_contracted_zero_events={} recursive_history_repaired_parent_refs={} central_history_input_events={} finalized_input_events={} finalized_events={} contracted_zero_events={} repaired_history_parent_refs={} compact_event_bytes={} full_event_bytes={} finalized_storage_bytes={} leaf_batch_seconds={:.6} leaf_read_thread_seconds={:.6} leaf_compute_thread_seconds={:.6} bucket_seconds={:.6} fan_in_seconds={:.6} root_combine_seconds={:.6} root_reduce_seconds={:.6} canonical_seconds={:.6} canonical_parenting=plateau",
         leaf_count,
         leaf_workers,
         combines,
@@ -2134,6 +2246,16 @@ pub fn compute_h0_merge_tree_hierarchical_zslabs(
         } else {
             "reference"
         },
+        if leaf_history_watch_filter {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if plateau_native_leaf {
+            "enabled"
+        } else {
+            "disabled"
+        },
         if recursive_history {
             "recursive-contract"
         } else {
@@ -2143,9 +2265,15 @@ pub fn compute_h0_merge_tree_hierarchical_zslabs(
         leaf_attach_stats.finalized_early,
         leaf_attach_stats.propagated_attach,
         leaf_attach_stats.local_history_input_events,
+        leaf_attach_stats.local_history_materialized_events,
         leaf_attach_stats.local_history_retained_events,
         leaf_attach_stats.local_history_contracted_zero_events,
         leaf_attach_stats.local_history_repaired_parent_refs,
+        leaf_attach_stats.local_history_parent_watch_checks,
+        leaf_attach_stats.local_history_parent_lookup_skips,
+        leaf_attach_stats.local_history_parent_hash_lookups,
+        leaf_attach_stats.local_history_zero_fast_drops,
+        leaf_attach_stats.plateau_zero_local_merges_elided,
         recursive_history_stats.nodes,
         recursive_history_stats.input_events,
         recursive_history_stats.retained_events,
@@ -2168,6 +2296,41 @@ pub fn compute_h0_merge_tree_hierarchical_zslabs(
         root_reduce_seconds,
         canonical_seconds,
     );
+    if leaf_kernel_audit_enabled() {
+        println!(
+            "PROFILE_BRANCH_H0_LEAF_KERNEL_AUDIT enabled=1 sample_stride={} activations={} interior_voxels={} boundary_voxels={} interface_activations={} global_boundary_activations={} active_state_checks={} active_neighbor_hits={} representative_neighbors={} pruner_cache_lookups={} pruner_cache_hits={} pruner_cache_misses={} pruner_mask_computations={} union_attempts={} union_successes={} union_already_connected={} union_local_local={} union_boundary_internal={} union_interface_interface={} union_outside_involved={} current_root_reused={} current_root_refinds={} find_calls={} find_parent_hops={} find_max_hops={} timing_samples={} activation_bookkeeping_sample_ns={} neighbor_pruning_sample_ns={} union_action_sample_ns={} bucket_build_ns={}",
+            leaf_kernel_audit_sample_stride(),
+            leaf_attach_stats.kernel_audit_activations,
+            leaf_attach_stats.kernel_audit_interior_voxels,
+            leaf_attach_stats.kernel_audit_boundary_voxels,
+            leaf_attach_stats.kernel_audit_interface_activations,
+            leaf_attach_stats.kernel_audit_global_boundary_activations,
+            leaf_attach_stats.kernel_audit_active_state_checks,
+            leaf_attach_stats.kernel_audit_active_neighbor_hits,
+            leaf_attach_stats.kernel_audit_representative_neighbors,
+            leaf_attach_stats.kernel_audit_pruner_cache_lookups,
+            leaf_attach_stats.kernel_audit_pruner_cache_hits,
+            leaf_attach_stats.kernel_audit_pruner_cache_misses,
+            leaf_attach_stats.kernel_audit_pruner_mask_computations,
+            leaf_attach_stats.kernel_audit_union_attempts,
+            leaf_attach_stats.kernel_audit_union_successes,
+            leaf_attach_stats.kernel_audit_union_already_connected,
+            leaf_attach_stats.kernel_audit_union_local_local,
+            leaf_attach_stats.kernel_audit_union_boundary_internal,
+            leaf_attach_stats.kernel_audit_union_interface_interface,
+            leaf_attach_stats.kernel_audit_union_outside_involved,
+            leaf_attach_stats.kernel_audit_current_root_reused,
+            leaf_attach_stats.kernel_audit_current_root_refinds,
+            leaf_attach_stats.kernel_audit_find_calls,
+            leaf_attach_stats.kernel_audit_find_parent_hops,
+            leaf_attach_stats.kernel_audit_find_max_hops,
+            leaf_attach_stats.kernel_audit_timing_samples,
+            leaf_attach_stats.kernel_audit_activation_bookkeeping_sample_ns,
+            leaf_attach_stats.kernel_audit_neighbor_pruning_sample_ns,
+            leaf_attach_stats.kernel_audit_union_action_sample_ns,
+            leaf_attach_stats.kernel_audit_bucket_build_ns,
+        );
+    }
     println!(
         "Hierarchical H0 branch-tree computation took {:.3} seconds",
         start.elapsed().as_secs_f64()
@@ -2198,6 +2361,8 @@ pub fn compute_h2_merge_tree_hierarchical_zslabs(
     let mut root_combine_seconds = 0.0f64;
     let early_finalize_leaf_attaches = early_finalize_leaf_attaches_enabled();
     let inline_leaf_history = inline_leaf_history_contraction_enabled();
+    let leaf_history_watch_filter = leaf_history_watch_filter_enabled();
+    let plateau_native_leaf = plateau_native_leaf_enabled() && inline_leaf_history;
     let recursive_history = recursive_history_contraction_enabled();
     let mut recursive_history_stats = RecursiveHistoryStats::default();
     let mut leaf_attach_stats = H2LeafAttachStats::default();
@@ -2240,12 +2405,97 @@ pub fn compute_h2_merge_tree_hierarchical_zslabs(
             leaf_attach_stats.finalized_early += attach_stats.finalized_early;
             leaf_attach_stats.propagated_attach += attach_stats.propagated_attach;
             leaf_attach_stats.local_history_input_events += attach_stats.local_history_input_events;
+            leaf_attach_stats.local_history_materialized_events +=
+                attach_stats.local_history_materialized_events;
             leaf_attach_stats.local_history_retained_events +=
                 attach_stats.local_history_retained_events;
             leaf_attach_stats.local_history_contracted_zero_events +=
                 attach_stats.local_history_contracted_zero_events;
             leaf_attach_stats.local_history_repaired_parent_refs +=
                 attach_stats.local_history_repaired_parent_refs;
+            leaf_attach_stats.local_history_parent_watch_checks +=
+                attach_stats.local_history_parent_watch_checks;
+            leaf_attach_stats.local_history_parent_lookup_skips +=
+                attach_stats.local_history_parent_lookup_skips;
+            leaf_attach_stats.local_history_parent_hash_lookups +=
+                attach_stats.local_history_parent_hash_lookups;
+            leaf_attach_stats.local_history_zero_fast_drops +=
+                attach_stats.local_history_zero_fast_drops;
+            leaf_attach_stats.plateau_zero_local_merges_elided +=
+                attach_stats.plateau_zero_local_merges_elided;
+            leaf_attach_stats.kernel_audit_activations += attach_stats.kernel_audit_activations;
+            leaf_attach_stats.kernel_audit_interior_voxels +=
+                attach_stats.kernel_audit_interior_voxels;
+            leaf_attach_stats.kernel_audit_boundary_voxels +=
+                attach_stats.kernel_audit_boundary_voxels;
+            leaf_attach_stats.kernel_audit_interface_activations +=
+                attach_stats.kernel_audit_interface_activations;
+            leaf_attach_stats.kernel_audit_global_boundary_activations +=
+                attach_stats.kernel_audit_global_boundary_activations;
+            leaf_attach_stats.kernel_audit_active_state_checks +=
+                attach_stats.kernel_audit_active_state_checks;
+            leaf_attach_stats.kernel_audit_active_neighbor_hits +=
+                attach_stats.kernel_audit_active_neighbor_hits;
+            leaf_attach_stats.kernel_audit_representative_neighbors +=
+                attach_stats.kernel_audit_representative_neighbors;
+            leaf_attach_stats.kernel_audit_pruner_cache_lookups +=
+                attach_stats.kernel_audit_pruner_cache_lookups;
+            leaf_attach_stats.kernel_audit_pruner_cache_hits +=
+                attach_stats.kernel_audit_pruner_cache_hits;
+            leaf_attach_stats.kernel_audit_pruner_cache_misses +=
+                attach_stats.kernel_audit_pruner_cache_misses;
+            leaf_attach_stats.kernel_audit_pruner_mask_computations +=
+                attach_stats.kernel_audit_pruner_mask_computations;
+            leaf_attach_stats.kernel_audit_union_attempts +=
+                attach_stats.kernel_audit_union_attempts;
+            leaf_attach_stats.kernel_audit_union_successes +=
+                attach_stats.kernel_audit_union_successes;
+            leaf_attach_stats.kernel_audit_union_already_connected +=
+                attach_stats.kernel_audit_union_already_connected;
+            leaf_attach_stats.kernel_audit_union_local_local +=
+                attach_stats.kernel_audit_union_local_local;
+            leaf_attach_stats.kernel_audit_union_boundary_internal +=
+                attach_stats.kernel_audit_union_boundary_internal;
+            leaf_attach_stats.kernel_audit_union_interface_interface +=
+                attach_stats.kernel_audit_union_interface_interface;
+            leaf_attach_stats.kernel_audit_union_outside_involved +=
+                attach_stats.kernel_audit_union_outside_involved;
+            leaf_attach_stats.kernel_audit_current_root_reused +=
+                attach_stats.kernel_audit_current_root_reused;
+            leaf_attach_stats.kernel_audit_current_root_refinds +=
+                attach_stats.kernel_audit_current_root_refinds;
+            leaf_attach_stats.kernel_audit_find_calls += attach_stats.kernel_audit_find_calls;
+            leaf_attach_stats.kernel_audit_find_parent_hops +=
+                attach_stats.kernel_audit_find_parent_hops;
+            leaf_attach_stats.kernel_audit_find_max_hops = leaf_attach_stats
+                .kernel_audit_find_max_hops
+                .max(attach_stats.kernel_audit_find_max_hops);
+            leaf_attach_stats.kernel_audit_shell_face_checks +=
+                attach_stats.kernel_audit_shell_face_checks;
+            leaf_attach_stats.kernel_audit_shell_active_face_hits +=
+                attach_stats.kernel_audit_shell_active_face_hits;
+            leaf_attach_stats.kernel_audit_shell_extra_state_checks +=
+                attach_stats.kernel_audit_shell_extra_state_checks;
+            leaf_attach_stats.kernel_audit_shell_extra_active_hits +=
+                attach_stats.kernel_audit_shell_extra_active_hits;
+            leaf_attach_stats.kernel_audit_shell_representatives +=
+                attach_stats.kernel_audit_shell_representatives;
+            leaf_attach_stats.kernel_audit_root_dedup_inputs +=
+                attach_stats.kernel_audit_root_dedup_inputs;
+            leaf_attach_stats.kernel_audit_root_dedup_unique +=
+                attach_stats.kernel_audit_root_dedup_unique;
+            leaf_attach_stats.kernel_audit_root_dedup_skipped +=
+                attach_stats.kernel_audit_root_dedup_skipped;
+            leaf_attach_stats.kernel_audit_timing_samples +=
+                attach_stats.kernel_audit_timing_samples;
+            leaf_attach_stats.kernel_audit_activation_bookkeeping_sample_ns +=
+                attach_stats.kernel_audit_activation_bookkeeping_sample_ns;
+            leaf_attach_stats.kernel_audit_neighbor_pruning_sample_ns +=
+                attach_stats.kernel_audit_neighbor_pruning_sample_ns;
+            leaf_attach_stats.kernel_audit_union_action_sample_ns +=
+                attach_stats.kernel_audit_union_action_sample_ns;
+            leaf_attach_stats.kernel_audit_bucket_build_ns +=
+                attach_stats.kernel_audit_bucket_build_ns;
             leaf_read_thread_seconds += read_seconds;
             leaf_compute_thread_seconds += compute_seconds;
             if !recursive_history {
@@ -2344,7 +2594,7 @@ pub fn compute_h2_merge_tree_hierarchical_zslabs(
     let tree = canonicalize_h2_plateaus(raw_tree)?;
     let canonical_seconds = canonical_start.elapsed().as_secs_f64();
     println!(
-        "PROFILE_BRANCH_H2_HIERARCHY leaf_slabs={} leaf_workers={} combines={} max_live_summaries={} max_pair_nodes={} final_interface_nodes={} leaf_attach_policy={} leaf_history_policy={} recursive_history_policy={} leaf_one_boundary_internal={} leaf_finalized_attach_early={} leaf_propagated_attach={} leaf_local_history_input_events={} leaf_local_history_retained_events={} leaf_local_history_contracted_zero_events={} leaf_local_history_repaired_parent_refs={} recursive_history_nodes={} recursive_history_input_events={} recursive_history_retained_events={} recursive_history_contracted_zero_events={} recursive_history_repaired_parent_refs={} central_history_input_events={} finalized_input_events={} finalized_events={} contracted_zero_events={} repaired_history_parent_refs={} compact_event_bytes={} full_event_bytes={} finalized_storage_bytes={} leaf_batch_seconds={:.6} leaf_read_thread_seconds={:.6} leaf_compute_thread_seconds={:.6} bucket_seconds={:.6} fan_in_seconds={:.6} root_combine_seconds={:.6} root_reduce_seconds={:.6} canonical_seconds={:.6} canonical_parenting=plateau",
+        "PROFILE_BRANCH_H2_HIERARCHY leaf_state_layout=packed-local-id leaf_neighbor_kernel=interior-fast leaf_worker_est_bytes_per_voxel=48 leaf_slabs={} leaf_workers={} combines={} max_live_summaries={} max_pair_nodes={} final_interface_nodes={} leaf_attach_policy={} leaf_history_policy={} leaf_history_watch_filter={} plateau_native_leaf={} recursive_history_policy={} leaf_one_boundary_internal={} leaf_finalized_attach_early={} leaf_propagated_attach={} leaf_local_history_input_events={} leaf_local_history_materialized_events={} leaf_local_history_retained_events={} leaf_local_history_contracted_zero_events={} leaf_local_history_repaired_parent_refs={} leaf_local_history_parent_watch_checks={} leaf_local_history_parent_lookup_skips={} leaf_local_history_parent_hash_lookups={} leaf_local_history_zero_fast_drops={} leaf_plateau_zero_local_merges_elided={} recursive_history_nodes={} recursive_history_input_events={} recursive_history_retained_events={} recursive_history_contracted_zero_events={} recursive_history_repaired_parent_refs={} central_history_input_events={} finalized_input_events={} finalized_events={} contracted_zero_events={} repaired_history_parent_refs={} compact_event_bytes={} full_event_bytes={} finalized_storage_bytes={} leaf_batch_seconds={:.6} leaf_read_thread_seconds={:.6} leaf_compute_thread_seconds={:.6} bucket_seconds={:.6} fan_in_seconds={:.6} root_combine_seconds={:.6} root_reduce_seconds={:.6} canonical_seconds={:.6} canonical_parenting=plateau",
         leaf_count,
         leaf_workers,
         combines,
@@ -2361,6 +2611,16 @@ pub fn compute_h2_merge_tree_hierarchical_zslabs(
         } else {
             "reference"
         },
+        if leaf_history_watch_filter {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if plateau_native_leaf {
+            "enabled"
+        } else {
+            "disabled"
+        },
         if recursive_history {
             "recursive-contract"
         } else {
@@ -2370,9 +2630,15 @@ pub fn compute_h2_merge_tree_hierarchical_zslabs(
         leaf_attach_stats.finalized_early,
         leaf_attach_stats.propagated_attach,
         leaf_attach_stats.local_history_input_events,
+        leaf_attach_stats.local_history_materialized_events,
         leaf_attach_stats.local_history_retained_events,
         leaf_attach_stats.local_history_contracted_zero_events,
         leaf_attach_stats.local_history_repaired_parent_refs,
+        leaf_attach_stats.local_history_parent_watch_checks,
+        leaf_attach_stats.local_history_parent_lookup_skips,
+        leaf_attach_stats.local_history_parent_hash_lookups,
+        leaf_attach_stats.local_history_zero_fast_drops,
+        leaf_attach_stats.plateau_zero_local_merges_elided,
         recursive_history_stats.nodes,
         recursive_history_stats.input_events,
         recursive_history_stats.retained_events,
@@ -2395,6 +2661,49 @@ pub fn compute_h2_merge_tree_hierarchical_zslabs(
         root_reduce_seconds,
         canonical_seconds,
     );
+    if leaf_kernel_audit_enabled() {
+        println!(
+            "PROFILE_BRANCH_H2_LEAF_KERNEL_AUDIT enabled=1 sample_stride={} activations={} interior_voxels={} boundary_voxels={} interface_activations={} global_boundary_activations={} active_state_checks={} active_neighbor_hits={} representative_neighbors={} pruner_cache_lookups={} pruner_cache_hits={} pruner_cache_misses={} pruner_mask_computations={} union_attempts={} union_successes={} union_already_connected={} union_local_local={} union_boundary_internal={} union_interface_interface={} union_outside_involved={} current_root_reused={} current_root_refinds={} find_calls={} find_parent_hops={} find_max_hops={} shell_face_checks={} shell_active_face_hits={} shell_extra_state_checks={} shell_extra_active_hits={} shell_representatives={} root_dedup_inputs={} root_dedup_unique={} root_dedup_skipped={} timing_samples={} activation_bookkeeping_sample_ns={} neighbor_pruning_sample_ns={} union_action_sample_ns={} bucket_build_ns={}",
+            leaf_kernel_audit_sample_stride(),
+            leaf_attach_stats.kernel_audit_activations,
+            leaf_attach_stats.kernel_audit_interior_voxels,
+            leaf_attach_stats.kernel_audit_boundary_voxels,
+            leaf_attach_stats.kernel_audit_interface_activations,
+            leaf_attach_stats.kernel_audit_global_boundary_activations,
+            leaf_attach_stats.kernel_audit_active_state_checks,
+            leaf_attach_stats.kernel_audit_active_neighbor_hits,
+            leaf_attach_stats.kernel_audit_representative_neighbors,
+            leaf_attach_stats.kernel_audit_pruner_cache_lookups,
+            leaf_attach_stats.kernel_audit_pruner_cache_hits,
+            leaf_attach_stats.kernel_audit_pruner_cache_misses,
+            leaf_attach_stats.kernel_audit_pruner_mask_computations,
+            leaf_attach_stats.kernel_audit_union_attempts,
+            leaf_attach_stats.kernel_audit_union_successes,
+            leaf_attach_stats.kernel_audit_union_already_connected,
+            leaf_attach_stats.kernel_audit_union_local_local,
+            leaf_attach_stats.kernel_audit_union_boundary_internal,
+            leaf_attach_stats.kernel_audit_union_interface_interface,
+            leaf_attach_stats.kernel_audit_union_outside_involved,
+            leaf_attach_stats.kernel_audit_current_root_reused,
+            leaf_attach_stats.kernel_audit_current_root_refinds,
+            leaf_attach_stats.kernel_audit_find_calls,
+            leaf_attach_stats.kernel_audit_find_parent_hops,
+            leaf_attach_stats.kernel_audit_find_max_hops,
+            leaf_attach_stats.kernel_audit_shell_face_checks,
+            leaf_attach_stats.kernel_audit_shell_active_face_hits,
+            leaf_attach_stats.kernel_audit_shell_extra_state_checks,
+            leaf_attach_stats.kernel_audit_shell_extra_active_hits,
+            leaf_attach_stats.kernel_audit_shell_representatives,
+            leaf_attach_stats.kernel_audit_root_dedup_inputs,
+            leaf_attach_stats.kernel_audit_root_dedup_unique,
+            leaf_attach_stats.kernel_audit_root_dedup_skipped,
+            leaf_attach_stats.kernel_audit_timing_samples,
+            leaf_attach_stats.kernel_audit_activation_bookkeeping_sample_ns,
+            leaf_attach_stats.kernel_audit_neighbor_pruning_sample_ns,
+            leaf_attach_stats.kernel_audit_union_action_sample_ns,
+            leaf_attach_stats.kernel_audit_bucket_build_ns,
+        );
+    }
     println!(
         "Hierarchical H2 branch-tree computation took {:.3} seconds",
         start.elapsed().as_secs_f64()

@@ -42,6 +42,11 @@ const OFFSETS_26: [(isize, isize, isize); 26] = [
     (1, 1, 1),
 ];
 
+// Bit positions in OFFSETS_26 corresponding to OFFSETS_6 order:
+// -x, +x, -y, +y, -z, +z. Keeping this order preserves the existing
+// deterministic face-neighbor visitation order when H2 shell pruning is used.
+const H2_FACE_BITS_IN_SIX_ORDER: [usize; 6] = [12, 13, 10, 15, 4, 21];
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LinearNeighborOffsets {
     offsets: [isize; MAX_NEIGHBORS],
@@ -70,6 +75,167 @@ impl RepresentativeNeighbors {
     pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.indices[..self.len].iter().copied()
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct H2ShellPruningStats {
+    pub(crate) face_state_checks: u64,
+    pub(crate) active_face_hits: u64,
+    pub(crate) extra_shell_state_checks: u64,
+    pub(crate) extra_shell_active_hits: u64,
+    pub(crate) representative_visits: u64,
+}
+
+/// Exact H2-only pruning for 6-connected face neighbors using connectivity in
+/// the already-active 3x3x3 shell around the newly activated center voxel.
+///
+/// The six face neighbors are the only edges that the 6-connected H2 leaf
+/// kernel may insert. Two such candidates are redundant when an already-active
+/// 6-connected path joins them inside the shell without using the center. This
+/// pruner discovers those paths lazily: it queries the six face states first
+/// and only explores additional shell voxels when at least two face candidates
+/// are active.
+///
+/// This object intentionally exposes only an interior fast path. Local slab
+/// boundary voxels conservatively use the ordinary six-neighbor path; exact UF
+/// root deduplication can still remove globally redundant boundary candidates.
+#[derive(Debug)]
+pub(crate) struct H2ShellFacePruner {
+    adjacency_masks: [u32; MAX_NEIGHBORS],
+    diagnostics: Option<H2ShellPruningStats>,
+}
+
+impl H2ShellFacePruner {
+    pub(crate) fn new(diagnostics: bool) -> Self {
+        Self {
+            adjacency_masks: build_adjacency_masks_for_offsets(&OFFSETS_26, Connectivity::Six),
+            diagnostics: diagnostics.then(H2ShellPruningStats::default),
+        }
+    }
+
+    pub(crate) fn diagnostic_stats(&self) -> H2ShellPruningStats {
+        self.diagnostics.unwrap_or_default()
+    }
+
+    pub(crate) fn linear_offsets(&self, width: usize, height: usize) -> LinearNeighborOffsets {
+        linear_offsets_for(&OFFSETS_26, width, height)
+    }
+
+    /// Return one active face neighbor from each 6-connected component of the
+    /// active shell. `center` must be strictly interior to the current slab so
+    /// all 26 shell positions are valid linear indices.
+    pub(crate) fn representative_face_neighbors_interior_by<F>(
+        &mut self,
+        center: usize,
+        linear_offsets: &LinearNeighborOffsets,
+        mut is_active: F,
+    ) -> RepresentativeNeighbors
+    where
+        F: FnMut(usize) -> bool,
+    {
+        debug_assert_eq!(linear_offsets.len, OFFSETS_26.len());
+
+        let mut known_mask = 0u32;
+        let mut active_mask = 0u32;
+        let mut active_face_mask = 0u32;
+        let mut neighbor_indices = [0usize; MAX_NEIGHBORS];
+        let mut active_face_hits = 0u64;
+
+        for &bit in &H2_FACE_BITS_IN_SIX_ORDER {
+            let bit_mask = 1u32 << bit;
+            let neighbor = center.wrapping_add_signed(linear_offsets.offsets[bit]);
+            neighbor_indices[bit] = neighbor;
+            known_mask |= bit_mask;
+            if is_active(neighbor) {
+                active_mask |= bit_mask;
+                active_face_mask |= bit_mask;
+                active_face_hits += 1;
+            }
+        }
+
+        if let Some(stats) = self.diagnostics.as_mut() {
+            stats.face_state_checks += H2_FACE_BITS_IN_SIX_ORDER.len() as u64;
+            stats.active_face_hits += active_face_hits;
+        }
+
+        if active_face_mask.count_ones() <= 1 {
+            if let Some(stats) = self.diagnostics.as_mut() {
+                stats.representative_visits += active_face_hits;
+            }
+            return representative_face_list(neighbor_indices, active_face_mask);
+        }
+
+        let mut remaining_faces = active_face_mask;
+        let mut representative_mask = 0u32;
+
+        while remaining_faces != 0 {
+            let seed = first_face_bit(remaining_faces).expect("nonempty face mask lost its seed");
+            let seed_mask = 1u32 << seed;
+            representative_mask |= seed_mask;
+
+            let mut component = 0u32;
+            let mut frontier = seed_mask;
+            while frontier != 0 {
+                let bit = frontier.trailing_zeros() as usize;
+                let bit_mask = 1u32 << bit;
+                frontier &= frontier - 1;
+                if component & bit_mask != 0 {
+                    continue;
+                }
+                component |= bit_mask;
+
+                let adjacent = self.adjacency_masks[bit];
+                let mut unknown = adjacent & !known_mask;
+                while unknown != 0 {
+                    let neighbor_bit = unknown.trailing_zeros() as usize;
+                    let neighbor_mask = 1u32 << neighbor_bit;
+                    unknown &= unknown - 1;
+                    known_mask |= neighbor_mask;
+                    let neighbor = center.wrapping_add_signed(linear_offsets.offsets[neighbor_bit]);
+                    if is_active(neighbor) {
+                        active_mask |= neighbor_mask;
+                        if let Some(stats) = self.diagnostics.as_mut() {
+                            stats.extra_shell_active_hits += 1;
+                        }
+                    }
+                    if let Some(stats) = self.diagnostics.as_mut() {
+                        stats.extra_shell_state_checks += 1;
+                    }
+                }
+
+                frontier |= adjacent & active_mask & !component;
+            }
+
+            remaining_faces &= !component;
+        }
+
+        if let Some(stats) = self.diagnostics.as_mut() {
+            stats.representative_visits += u64::from(representative_mask.count_ones());
+        }
+        representative_face_list(neighbor_indices, representative_mask)
+    }
+}
+
+fn first_face_bit(mask: u32) -> Option<usize> {
+    H2_FACE_BITS_IN_SIX_ORDER
+        .iter()
+        .copied()
+        .find(|&bit| mask & (1u32 << bit) != 0)
+}
+
+fn representative_face_list(
+    neighbor_indices: [usize; MAX_NEIGHBORS],
+    representative_mask: u32,
+) -> RepresentativeNeighbors {
+    let mut indices = [0usize; MAX_NEIGHBORS];
+    let mut len = 0usize;
+    for &bit in &H2_FACE_BITS_IN_SIX_ORDER {
+        if representative_mask & (1u32 << bit) != 0 {
+            indices[len] = neighbor_indices[bit];
+            len += 1;
+        }
+    }
+    RepresentativeNeighbors { indices, len }
 }
 
 /// Exact graph-neighborhood pruning for event-based voxel activation.
@@ -281,21 +447,7 @@ impl NeighborhoodComponentPruner {
     /// These deltas are valid only for voxels strictly inside all six local
     /// slab faces. Boundary voxels must use `for_each_representative_neighbor`.
     pub(crate) fn linear_offsets(&self, width: usize, height: usize) -> LinearNeighborOffsets {
-        let slice_size = width
-            .checked_mul(height)
-            .expect("slice size overflow in local pruning");
-        let width = isize::try_from(width).expect("width exceeds isize in local pruning");
-        let slice_size =
-            isize::try_from(slice_size).expect("slice size exceeds isize in local pruning");
-        let mut linear = [0isize; MAX_NEIGHBORS];
-        let offsets = self.offsets();
-        for (bit, &(dx, dy, dz)) in offsets.iter().enumerate() {
-            linear[bit] = dz * slice_size + dy * width + dx;
-        }
-        LinearNeighborOffsets {
-            offsets: linear,
-            len: offsets.len(),
-        }
+        linear_offsets_for(self.offsets(), width, height)
     }
 
     /// Fast path for a center voxel strictly inside the local slab.
@@ -450,6 +602,27 @@ impl NeighborhoodComponentPruner {
     }
 }
 
+fn linear_offsets_for(
+    offsets: &[(isize, isize, isize)],
+    width: usize,
+    height: usize,
+) -> LinearNeighborOffsets {
+    let slice_size = width
+        .checked_mul(height)
+        .expect("slice size overflow in local pruning");
+    let width = isize::try_from(width).expect("width exceeds isize in local pruning");
+    let slice_size =
+        isize::try_from(slice_size).expect("slice size exceeds isize in local pruning");
+    let mut linear = [0isize; MAX_NEIGHBORS];
+    for (bit, &(dx, dy, dz)) in offsets.iter().enumerate() {
+        linear[bit] = dz * slice_size + dy * width + dx;
+    }
+    LinearNeighborOffsets {
+        offsets: linear,
+        len: offsets.len(),
+    }
+}
+
 fn representative_list(
     neighbor_indices: [usize; MAX_NEIGHBORS],
     mut representative_mask: u32,
@@ -474,9 +647,14 @@ fn build_adjacency_masks(connectivity: Connectivity) -> [u32; MAX_NEIGHBORS] {
         Connectivity::Six => &OFFSETS_6,
         Connectivity::TwentySix => &OFFSETS_26,
     };
+    build_adjacency_masks_for_offsets(offsets, connectivity)
+}
 
+fn build_adjacency_masks_for_offsets(
+    offsets: &[(isize, isize, isize)],
+    connectivity: Connectivity,
+) -> [u32; MAX_NEIGHBORS] {
     let mut masks = [0u32; MAX_NEIGHBORS];
-
     for (i, &a) in offsets.iter().enumerate() {
         for (j, &b) in offsets.iter().enumerate() {
             if i != j && offsets_are_adjacent(a, b, connectivity) {
@@ -484,7 +662,6 @@ fn build_adjacency_masks(connectivity: Connectivity) -> [u32; MAX_NEIGHBORS] {
             }
         }
     }
-
     masks
 }
 
@@ -692,5 +869,51 @@ mod tests {
         assert_eq!(stats.cache_hits, 0);
         assert_eq!(stats.cache_misses, 0);
         assert_eq!(stats.component_mask_computations, 1);
+    }
+
+    #[test]
+    fn h2_shell_pruner_removes_face_edge_with_active_bridge() {
+        let width = 5usize;
+        let height = 5usize;
+        let depth = 5usize;
+        let center = 2 * width * height + 2 * width + 2;
+        let mut active = vec![0u8; width * height * depth];
+        let index = |x: usize, y: usize, z: usize| z * width * height + y * width + x;
+
+        // +x and +y are not directly 6-adjacent, but the active edge voxel
+        // (+x,+y,0) joins them inside the shell without using the center.
+        active[index(3, 2, 2)] = 1;
+        active[index(2, 3, 2)] = 1;
+        active[index(3, 3, 2)] = 1;
+
+        let mut pruner = H2ShellFacePruner::new(false);
+        let offsets = pruner.linear_offsets(width, height);
+        let representatives =
+            pruner.representative_face_neighbors_interior_by(center, &offsets, |neighbor| {
+                active[neighbor] != 0
+            });
+        assert_eq!(representatives.iter().count(), 1);
+        assert_eq!(representatives.iter().next(), Some(index(3, 2, 2)));
+    }
+
+    #[test]
+    fn h2_shell_pruner_keeps_face_neighbors_without_shell_path() {
+        let width = 5usize;
+        let height = 5usize;
+        let depth = 5usize;
+        let center = 2 * width * height + 2 * width + 2;
+        let mut active = vec![0u8; width * height * depth];
+        let index = |x: usize, y: usize, z: usize| z * width * height + y * width + x;
+
+        active[index(3, 2, 2)] = 1;
+        active[index(2, 3, 2)] = 1;
+
+        let mut pruner = H2ShellFacePruner::new(false);
+        let offsets = pruner.linear_offsets(width, height);
+        let representatives =
+            pruner.representative_face_neighbors_interior_by(center, &offsets, |neighbor| {
+                active[neighbor] != 0
+            });
+        assert_eq!(representatives.iter().count(), 2);
     }
 }

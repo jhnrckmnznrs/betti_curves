@@ -1,5 +1,43 @@
 # Changelog
 
+## v18 freeze checkpoint — H2 exact UF-root deduplication
+
+- Promoted exact fixed-array H2 UF-root deduplication to the production default.
+- Changed the lazy 3x3x3 shell-component pruner to opt-in only (`BETTI_HIER_H2_SHELL_PRUNE=1`) after the controlled d16 A/B showed substantial slowdown from extra shell-state checks.
+- Preserved `BETTI_HIER_H2_ROOT_DEDUP=0` as the exact same-binary reference path.
+- Recorded the freeze benchmark and decision in `docs/h2-root-dedup-freeze.md`.
+- No H0 algorithm changes.
+
+## v18 experimental — H2 shell-component pruning and exact root deduplication
+
+- Added an H2-only lazy 3x3x3 shell pruner for six-connected face neighbors. It retains one face edge per already-active shell component and never scans shell voxels unless multiple face candidates are active.
+- Added exact fixed-array UF-root deduplication before H2 union/action processing. For six-connectivity at most six pre-existing roots are collected (the fixed buffer also supports the 26-connected mode); duplicate roots are skipped before the union kernel.
+- Added independent A/B switches: `BETTI_HIER_H2_SHELL_PRUNE=0` and `BETTI_HIER_H2_ROOT_DEDUP=0`.
+- Extended the leaf-kernel audit with shell-query and root-dedup counters.
+- Added `validation/check_h2_shell_root_pruning_model.py` plus Rust shell-pruner unit tests.
+- H0 is unchanged.
+
+## v16 experimental — plateau-native leaf zero-death elision
+
+- Hierarchical H0/H2 leaves now discard finite zero-persistence local deaths directly at the union decision, before constructing local merge records or entering the leaf history contractor.
+- The optimization preserves sequential voxel activation and the exact neighborhood-pruning invariant; it does **not** pre-activate an entire equal-value plateau. Interface merges, boundary-state-changing attaches, and H2 Outside transitions are unchanged.
+- Added `BETTI_HIER_PLATEAU_NATIVE_LEAF=0` for same-binary v15 A/B validation and profiling.
+- Added `leaf_plateau_zero_local_merges_elided` profiling plus `validation/check_plateau_native_leaf_elision_model.py` and `docs/plateau-native-leaf-elision.md`.
+
+## v15 experimental — watched zero-history leaf fast path
+
+- Leaf-local finalized history now stays in compact slab-local IDs until export, avoiding full branch construction for the tens of millions of zero-persistence events that disappear inside a leaf.
+- Added an exact one-bit-per-local-branch watch filter. When a finalized child is not referenced by any retained positive event, the local contractor skips the sparse parent `HashMap` lookup entirely; filtration-aware repair is unchanged for watched parents.
+- Added H0/H2 profiling counters for watch checks, skipped lookups, actual parent-map lookups, and zero-persistence fast drops. `BETTI_HIER_LEAF_HISTORY_WATCH_FILTER=0` disables only the watch shortcut for A/B profiling.
+- Added `validation/check_leaf_history_watch_filter_model.py` and the design note `docs/leaf-history-watch-filter.md`.
+
+## v14.1 experimental — compact fused leaves compile fix
+
+- Fixed the H0/H2 compact `LocalUnionFind::new` constructors to bind the slab-local `voxel_count` from `Block::voxel_count()` before allocating packed state.
+- Added a debug assertion that `block.values.len()` matches the slab voxel count.
+- No algorithmic or profiling semantics changed from v14.
+
+
 All notable user-facing changes are documented here. This project follows [Semantic Versioning](https://semver.org/) and the structure of [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
@@ -29,6 +67,11 @@ All notable user-facing changes are documented here. This project follows [Seman
 
 
 ### Performance
+
+- Added an opt-in v17 leaf-kernel audit (`BETTI_HIER_LEAF_KERNEL_AUDIT=1`). It preserves the v16 reducer while counting active-neighbor pruning, representative edges, successful/no-op union attempts, union classes, carried-root reuse, H2 Outside involvement, and union-find parent depths. Timing is sampled at a configurable stride (`BETTI_HIER_LEAF_AUDIT_SAMPLE_STRIDE`, default 4096) to keep diagnostic overhead bounded; the external branch-tree profiler records both raw counters and derived ratios.
+
+- Experimental compact branch-tree leaf state replaces the per-voxel full H0/H2 branch object, separate rank array, and separate active byte with packed parent/rank state plus one local elder ID and one interface representative. Branch birth/global IDs are reconstructed from the slab values only when an event is emitted. The leaf sweep also uses the existing interior linear-offset neighborhood kernel and carries the current UF root across representative unions. This is intended to make d16/d32 leaves practical without giving up four-way leaf concurrency, reducing hierarchy seams and interface replay at the source.
+- The concurrent-leaf memory estimator is reduced from 128 to 48 bytes/voxel for this compact layout; `BETTI_HIER_LEAF_WORKERS` and `BETTI_HIER_LEAF_BUDGET_MB` remain explicit overrides. Profiling now reports the compact leaf-state capacity and layout.
 
 - Hierarchical leaf slabs now contract zero-persistence finalized history inline before returning their summaries. This preserves the v10 early-attach pruning while preventing diagonal leaf deaths from being materialized and rebucketed centrally. `BETTI_HIER_INLINE_LEAF_HISTORY=0` restores the v10 central-only contraction path in the same binary. Profiling reports raw/retained leaf history, leaf-local zero contractions and parent repairs, and central-history input volume.
 - Hierarchical leaf summaries now finalize non-promoting boundary/internal branch deaths immediately into deferred-repair history instead of exporting them as provisional attach events. The optimization is hierarchical-only; flat/in-memory slab summaries remain unchanged as the correctness reference. Set `BETTI_HIER_EARLY_FINALIZE_LEAF_ATTACHES=0` to restore the v9 leaf behavior in the same binary. Profiling reports leaf one-boundary/internal candidates, early-finalized deaths, propagated attaches, and per-combine input attach/interface counts.
