@@ -132,7 +132,7 @@ fn print_usage() {
     eprintln!("  h0-scalar            exact U8/U16/F32/F64 H0 persistence");
     eprintln!("  h0-scalar-hierarchical experimental exact hierarchical H0 persistence");
     eprintln!(
-        "  h0-scalar-hierarchical-stream experimental optimized disk-backed hierarchical F32 H0 persistence"
+        "  h0-scalar-hierarchical-stream experimental optimized disk-backed hierarchical scalar H0 persistence (U8/U16/F32/F64)"
     );
     eprintln!("  h0-scalar-stream     disk-backed exact scalar H0 persistence");
     eprintln!("  h0-scalar-batch      in-memory recursive batch processing");
@@ -143,7 +143,7 @@ fn print_usage() {
     eprintln!("  h2-scalar-batch      in-memory recursive batch processing");
     eprintln!("  h2-scalar-stream     disk-backed exact scalar H2 persistence");
     eprintln!(
-        "  h2-scalar-hierarchical-stream experimental optimized outside-aware hierarchical F32 H2 persistence"
+        "  h2-scalar-hierarchical-stream experimental optimized outside-aware hierarchical scalar H2 persistence (U8/U16/F32/F64)"
     );
     eprintln!("  h2-scalar-batch-stream disk-backed recursive batch processing");
     eprintln!("  branch-tree-h0        in-memory H0 elder-rule branch tree");
@@ -170,7 +170,7 @@ fn print_usage() {
     eprintln!("  --representative-active-check <recheck|trust-pruner> default: recheck");
     eprintln!("  --union-kernel <conventional|root-carrying> default: root-carrying");
     eprintln!(
-        "  --neighbor-root-check <find|parent-shortcut> default: parent-shortcut (H2 root-carrying only)"
+        "  --neighbor-root-check <find|parent-shortcut|parent-two-hop|parent-cached-find> default: parent-shortcut (H2 root-carrying only)"
     );
     eprintln!("  --h0-pruning-cache <off|4k|16k|64k|256k>  default: 64k (H0 26-connectivity only)");
     eprintln!(
@@ -381,7 +381,9 @@ fn split_run_arguments(args: &[String]) -> Result<(Vec<&String>, RunOptions)> {
                 "--neighbor-root-check" => {
                     index += 1;
                     let value = args.get(index).ok_or_else(|| {
-                        anyhow::anyhow!("--neighbor-root-check requires find or parent-shortcut")
+                        anyhow::anyhow!(
+                            "--neighbor-root-check requires find, parent-shortcut, parent-two-hop, or parent-cached-find"
+                        )
                     })?;
                     options.scalar_tuning.neighbor_root_check =
                         NeighborRootCheckStrategy::parse(value)?;
@@ -1738,6 +1740,50 @@ mod tests {
         assert_eq!(
             options.scalar_tuning.neighbor_root_check,
             NeighborRootCheckStrategy::ParentShortcut
+        );
+        assert!(options.scalar_tuning_overridden);
+    }
+
+    #[test]
+    fn neighbor_root_two_hop_option_is_parsed() {
+        let args = strings(&[
+            "betti_curves",
+            "stack",
+            "--neighbor-root-check=parent-two-hop",
+        ]);
+        let (positionals, options) = split_run_arguments(&args).unwrap();
+        assert_eq!(
+            positionals
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["stack"]
+        );
+        assert_eq!(
+            options.scalar_tuning.neighbor_root_check,
+            NeighborRootCheckStrategy::ParentTwoHop
+        );
+        assert!(options.scalar_tuning_overridden);
+    }
+
+    #[test]
+    fn neighbor_root_cached_find_option_is_parsed() {
+        let args = strings(&[
+            "betti_curves",
+            "stack",
+            "--neighbor-root-check=parent-cached-find",
+        ]);
+        let (positionals, options) = split_run_arguments(&args).unwrap();
+        assert_eq!(
+            positionals
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["stack"]
+        );
+        assert_eq!(
+            options.scalar_tuning.neighbor_root_check,
+            NeighborRootCheckStrategy::ParentCachedFind
         );
         assert!(options.scalar_tuning_overridden);
     }

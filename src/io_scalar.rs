@@ -6,7 +6,7 @@ use std::time::Instant;
 use tiff::ColorType;
 use tiff::decoder::{Decoder, DecodingResult};
 
-use crate::scalar::{F32Key, ScalarKey};
+use crate::scalar::{F32Key, ScalarKey, U16Key};
 use crate::tiff_paths::list_tiff_slices;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,13 @@ impl ScalarBlock {
     pub fn voxel_count(&self) -> usize {
         self.shape[0] * self.shape[1] * self.shape[2]
     }
+}
+
+/// Native-width U16 slab used by optimized integer persistence streams.
+#[derive(Debug)]
+pub struct U16ScalarBlock {
+    pub shape: [usize; 3],
+    pub values: Vec<U16Key>,
 }
 
 /// Native-width F32 slab used by the optimized scalar persistence streams.
@@ -190,6 +197,53 @@ impl ScalarTiffStackReader {
                 shape: [self.width, self.height, slab_depth],
                 values,
                 pixel_type: self.pixel_type,
+            },
+            profile,
+        ))
+    }
+
+    /// Read a U16 slab directly into four-byte exact keys.
+    pub(crate) fn read_z_slab_u16_native_profiled(
+        &self,
+        z0: usize,
+        z1: usize,
+    ) -> Result<(U16ScalarBlock, ScalarReadProfile)> {
+        if self.pixel_type != ScalarPixelType::U16 {
+            bail!(
+                "native U16 slab requested for {} TIFF stack",
+                self.pixel_type
+            );
+        }
+        if z0 >= z1 || z1 > self.depth {
+            bail!("invalid z range {z0}..{z1} for depth {}", self.depth);
+        }
+
+        let slab_depth = z1 - z0;
+        let slice_size = self
+            .width
+            .checked_mul(self.height)
+            .ok_or_else(|| anyhow::anyhow!("scalar TIFF slice size overflow"))?;
+        let capacity = slice_size
+            .checked_mul(slab_depth)
+            .ok_or_else(|| anyhow::anyhow!("scalar TIFF slab size overflow"))?;
+        let mut values = Vec::with_capacity(capacity);
+        let mut profile = ScalarReadProfile::default();
+
+        for z in z0..z1 {
+            let slice_profile = append_tiff_u16_native_profiled(
+                &self.paths[z],
+                self.width,
+                self.height,
+                &mut values,
+            )
+            .with_context(|| format!("failed to read U16 slice {:?}", self.paths[z]))?;
+            profile.add_assign(slice_profile);
+        }
+
+        Ok((
+            U16ScalarBlock {
+                shape: [self.width, self.height, slab_depth],
+                values,
             },
             profile,
         ))
@@ -384,6 +438,65 @@ fn read_tiff_scalar_profiled(
     ))
 }
 
+fn append_tiff_u16_native_profiled(
+    path: &Path,
+    expected_width: usize,
+    expected_height: usize,
+    output: &mut Vec<U16Key>,
+) -> Result<ScalarReadProfile> {
+    let file = File::open(path).with_context(|| format!("could not open TIFF file {path:?}"))?;
+    let reader = BufReader::new(file);
+    let mut decoder = Decoder::new(reader)
+        .with_context(|| format!("could not create TIFF decoder for {path:?}"))?;
+    let (width, height) = decoder
+        .dimensions()
+        .with_context(|| format!("could not read dimensions for {path:?}"))?;
+    if width as usize != expected_width || height as usize != expected_height {
+        bail!(
+            "slice {path:?} has {} x {}, expected {} x {}",
+            width,
+            height,
+            expected_width,
+            expected_height
+        );
+    }
+    let color_type = decoder
+        .colortype()
+        .with_context(|| format!("could not read TIFF color type for {path:?}"))?;
+    if color_type != ColorType::Gray(16) {
+        bail!("{path:?} is {color_type:?}; native U16 path requires grayscale U16 TIFF");
+    }
+
+    let expected = expected_width * expected_height;
+    let decode_start = Instant::now();
+    let image = decoder
+        .read_image()
+        .with_context(|| format!("could not decode TIFF image {path:?}"))?;
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+
+    let conversion_start = Instant::now();
+    match image {
+        DecodingResult::U16(data) => {
+            validate_length(path, data.len(), expected, "U16")?;
+            output.reserve(data.len());
+            output.extend(data.into_iter().map(U16Key::from_u16));
+        }
+        other => bail!(
+            "TIFF decoder returned {other:?} for {path:?}; native U16 path requires U16 samples"
+        ),
+    }
+    let key_conversion_seconds = conversion_start.elapsed().as_secs_f64();
+
+    if decoder.more_images() {
+        bail!("{path:?} contains more than one TIFF page; supply one single-page file per z-slice");
+    }
+    Ok(ScalarReadProfile {
+        decode_seconds,
+        key_conversion_seconds,
+        slab_copy_seconds: 0.0,
+    })
+}
+
 fn append_tiff_f32_native_profiled(
     path: &Path,
     expected_width: usize,
@@ -511,6 +624,38 @@ mod tests {
 
         std::fs::remove_file(f32_path).unwrap();
         std::fs::remove_file(f64_path).unwrap();
+    }
+
+    #[test]
+    fn native_u16_slab_matches_legacy_wide_values() {
+        let directory = std::env::temp_dir().join(format!(
+            "betti_curves_native_u16_stack_{}_{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = [[0u16, 7, 65_535, 42], [2, 2, 9_000, 1]];
+        for (z, values) in source.iter().enumerate() {
+            let path = directory.join(format!("{z:03}.tif"));
+            let file = File::create(path).unwrap();
+            let mut encoder = TiffEncoder::new(file).unwrap();
+            encoder
+                .write_image::<colortype::Gray16>(2, 2, values)
+                .unwrap();
+        }
+
+        let reader = ScalarTiffStackReader::open(&directory).unwrap();
+        let wide = reader.read_z_slab(0, 2).unwrap();
+        let (native, _) = reader.read_z_slab_u16_native_profiled(0, 2).unwrap();
+        let widened: Vec<_> = native
+            .values
+            .iter()
+            .copied()
+            .map(U16Key::to_scalar_key)
+            .collect();
+        assert_eq!(wide.values, widened);
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

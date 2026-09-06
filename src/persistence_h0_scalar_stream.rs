@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
@@ -16,9 +17,12 @@ use crate::persistence_h0_scalar::{
     H0SlabPreparationProfile, InterfaceMergeEvent, SlabH0Summary,
     process_slab_h0_persistence_f32_native_direct_profiled,
     process_slab_h0_persistence_f32_native_owned_profiled,
-    process_slab_h0_persistence_f32_native_profiled, process_slab_h0_persistence_scalar_profiled,
+    process_slab_h0_persistence_f32_native_profiled,
+    process_slab_h0_persistence_scalar_direct_profiled,
+    process_slab_h0_persistence_scalar_profiled,
+    process_slab_h0_persistence_u16_native_direct_profiled,
 };
-use crate::scalar::{F32Key, LocalScalarKey, ScalarKey};
+use crate::scalar::{F32Key, LocalScalarKey, ScalarKey, U16Key};
 use crate::scalar_order::RadixScalarKey;
 use crate::scalar_stream_tuning::{
     EventOrderStrategy, F32KeyMode, GlobalH0UnionFindLayoutStrategy, H0BirthBufferStrategy,
@@ -27,6 +31,54 @@ use crate::scalar_stream_tuning::{
 };
 use crate::temp_runs::TempRunDirectory;
 use crate::tiff_paths::find_tiff_stack_directories;
+
+const DEFAULT_PERSIST_H0_LEAF_WORKERS: usize = 4;
+const DEFAULT_PERSIST_H0_LEAF_BUDGET_MB: usize = 512;
+const ESTIMATED_PERSIST_H0_LEAF_BYTES_PER_VOXEL: usize = 40;
+
+fn persistence_h0_leaf_workers(volume: &ScalarTiffStackReader, slab_depth: usize) -> usize {
+    let rayon_threads = rayon::current_num_threads().max(1);
+    if let Ok(raw) = std::env::var("BETTI_PERSIST_H0_LEAF_WORKERS") {
+        if let Ok(requested) = raw.parse::<usize>() {
+            if requested > 0 {
+                return requested.min(rayon_threads);
+            }
+        }
+        eprintln!(
+            "warning: ignoring invalid BETTI_PERSIST_H0_LEAF_WORKERS={raw:?}; expected a positive integer"
+        );
+    }
+
+    let budget_mb = std::env::var("BETTI_PERSIST_H0_LEAF_BUDGET_MB")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_PERSIST_H0_LEAF_BUDGET_MB);
+    let budget_bytes = budget_mb.saturating_mul(1024 * 1024);
+    let leaf_depth = slab_depth.min(volume.depth.max(1));
+    let leaf_voxels = volume
+        .width
+        .saturating_mul(volume.height)
+        .saturating_mul(leaf_depth);
+    let estimated_worker_bytes = leaf_voxels
+        .saturating_mul(ESTIMATED_PERSIST_H0_LEAF_BYTES_PER_VOXEL)
+        .max(1);
+    let memory_limited = (budget_bytes / estimated_worker_bytes).max(1);
+
+    rayon_threads
+        .min(DEFAULT_PERSIST_H0_LEAF_WORKERS)
+        .min(memory_limited)
+        .max(1)
+}
+
+fn u16_native_persistence_enabled() -> bool {
+    !matches!(
+        std::env::var("BETTI_PERSIST_U16_NATIVE_KEYS")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
 
 #[derive(Debug, Clone)]
 struct SlabDescriptor {
@@ -145,6 +197,26 @@ impl DiskScalarKey for ScalarKey {
         let mut bytes = [0u8; 8];
         if read_exact_or_eof(reader, &mut bytes)? {
             Ok(Some(ScalarKey::from_raw(u64::from_le_bytes(bytes))))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl DiskScalarKey for U16Key {
+    const DISK_BYTES: usize = 4;
+
+    #[inline]
+    fn write_disk(self, writer: &mut BufWriter<File>) -> Result<()> {
+        writer.write_all(&self.raw().to_le_bytes())?;
+        Ok(())
+    }
+
+    #[inline]
+    fn read_disk(reader: &mut BufReader<File>) -> Result<Option<Self>> {
+        let mut bytes = [0u8; 4];
+        if read_exact_or_eof(reader, &mut bytes)? {
+            Ok(Some(U16Key::from_raw(u32::from_le_bytes(bytes))))
         } else {
             Ok(None)
         }
@@ -2118,6 +2190,204 @@ fn finalize_disk_h0_pair<K: DiskScalarKey>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn prepare_disk_h0_leaf_scalar(
+    volume: &ScalarTiffStackReader,
+    slab_id: usize,
+    z0: usize,
+    z1: usize,
+    connectivity: Connectivity,
+    directory: &Path,
+    summary_id: usize,
+    pair_writer: &mut BufWriter<File>,
+    tuning: ScalarStreamTuning,
+) -> Result<(
+    DiskHierarchicalH0Summary<ScalarKey>,
+    H0SlabPreparationProfile,
+)> {
+    let attach_path = directory.join(format!("h0_hier_attach_{summary_id:06}.bin"));
+    let interface_path = directory.join(format!("h0_hier_interface_{summary_id:06}.bin"));
+    let mut attach_writer = BufWriter::new(File::create(&attach_path)?);
+    let mut interface_writer = BufWriter::new(File::create(&interface_path)?);
+    let mut previous_attach_value: Option<ScalarKey> = None;
+    let mut previous_interface_value: Option<ScalarKey> = None;
+
+    let (block, _read_profile) = volume.read_z_slab_profiled(z0, z1)?;
+    let (summary, slab_profile) = process_slab_h0_persistence_scalar_direct_profiled(
+        slab_id,
+        block,
+        connectivity,
+        tuning.neighbor_kernel,
+        tuning.representative_active_check,
+        tuning.union_kernel,
+        tuning.h0_pruning_cache,
+        tuning.active_state,
+        tuning.interface_state,
+        tuning.uf_layout,
+        tuning.sweep_diagnostics,
+        |event| {
+            match event {
+                H0LocalStreamEvent::FinalPair(pair) => write_finite_pair(pair_writer, pair)?,
+                H0LocalStreamEvent::Attach(event) => {
+                    if previous_attach_value.is_some_and(|value| event.value < value) {
+                        bail!(
+                            "hierarchical direct H0 attach events are not monotone within slab {slab_id}"
+                        );
+                    }
+                    previous_attach_value = Some(event.value);
+                    write_attach_event(
+                        &mut attach_writer,
+                        AttachDiskEvent {
+                            value: event.value,
+                            node: event.interface_node,
+                            branch_birth: event.branch_birth,
+                        },
+                    )?;
+                }
+                H0LocalStreamEvent::InterfaceMerge(event) => {
+                    if previous_interface_value.is_some_and(|value| event.value < value) {
+                        bail!(
+                            "hierarchical direct H0 interface events are not monotone within slab {slab_id}"
+                        );
+                    }
+                    previous_interface_value = Some(event.value);
+                    write_pair_event(
+                        &mut interface_writer,
+                        PairEvent {
+                            value: event.value,
+                            a: event.a,
+                            b: event.b,
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    attach_writer.flush()?;
+    interface_writer.flush()?;
+
+    Ok((
+        DiskHierarchicalH0Summary {
+            z0,
+            z1,
+            width: volume.width,
+            height: volume.height,
+            interface_node_count: summary.interface_node_count,
+            lower_values: summary.z_min_face.values,
+            upper_values: summary.z_max_face.values,
+            attach_path,
+            interface_path,
+        },
+        slab_profile,
+    ))
+}
+
+#[derive(Debug)]
+struct BufferedH0U16Leaf {
+    slab_id: usize,
+    summary: DiskHierarchicalH0Summary<U16Key>,
+    profile: H0SlabPreparationProfile,
+    finalized_pairs: Vec<FinitePair<U16Key>>,
+}
+
+/// Prepare one U16 H0 leaf without sharing a global pair writer.
+///
+/// Finalized positive pairs are buffered in memory and handed off in slab order
+/// by the coordinator. The retained pair count is tiny compared with the voxel
+/// state, so this avoids synchronization while preserving deterministic output.
+#[allow(clippy::too_many_arguments)]
+fn prepare_disk_h0_leaf_u16_buffered(
+    volume: &ScalarTiffStackReader,
+    slab_id: usize,
+    z0: usize,
+    z1: usize,
+    connectivity: Connectivity,
+    directory: &Path,
+    summary_id: usize,
+    tuning: ScalarStreamTuning,
+) -> Result<BufferedH0U16Leaf> {
+    let attach_path = directory.join(format!("h0_hier_attach_{summary_id:06}.bin"));
+    let interface_path = directory.join(format!("h0_hier_interface_{summary_id:06}.bin"));
+    let mut attach_writer = BufWriter::new(File::create(&attach_path)?);
+    let mut interface_writer = BufWriter::new(File::create(&interface_path)?);
+    let mut previous_attach_value: Option<U16Key> = None;
+    let mut previous_interface_value: Option<U16Key> = None;
+    let mut finalized_pairs = Vec::new();
+
+    let (block, _read_profile) = volume.read_z_slab_u16_native_profiled(z0, z1)?;
+    let (summary, profile) = process_slab_h0_persistence_u16_native_direct_profiled(
+        slab_id,
+        block,
+        connectivity,
+        tuning.neighbor_kernel,
+        tuning.representative_active_check,
+        tuning.union_kernel,
+        tuning.h0_pruning_cache,
+        tuning.active_state,
+        tuning.interface_state,
+        tuning.uf_layout,
+        tuning.sweep_diagnostics,
+        |event| {
+            match event {
+                H0LocalStreamEvent::FinalPair(pair) => finalized_pairs.push(pair),
+                H0LocalStreamEvent::Attach(event) => {
+                    if previous_attach_value.is_some_and(|value| event.value < value) {
+                        bail!(
+                            "hierarchical direct H0 attach events are not monotone within slab {slab_id}"
+                        );
+                    }
+                    previous_attach_value = Some(event.value);
+                    write_attach_event(
+                        &mut attach_writer,
+                        AttachDiskEvent {
+                            value: event.value,
+                            node: event.interface_node,
+                            branch_birth: event.branch_birth,
+                        },
+                    )?;
+                }
+                H0LocalStreamEvent::InterfaceMerge(event) => {
+                    if previous_interface_value.is_some_and(|value| event.value < value) {
+                        bail!(
+                            "hierarchical direct H0 interface events are not monotone within slab {slab_id}"
+                        );
+                    }
+                    previous_interface_value = Some(event.value);
+                    write_pair_event(
+                        &mut interface_writer,
+                        PairEvent {
+                            value: event.value,
+                            a: event.a,
+                            b: event.b,
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    attach_writer.flush()?;
+    interface_writer.flush()?;
+
+    Ok(BufferedH0U16Leaf {
+        slab_id,
+        summary: DiskHierarchicalH0Summary {
+            z0,
+            z1,
+            width: volume.width,
+            height: volume.height,
+            interface_node_count: summary.interface_node_count,
+            lower_values: summary.z_min_face.values,
+            upper_values: summary.z_max_face.values,
+            attach_path,
+            interface_path,
+        },
+        profile,
+        finalized_pairs,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_disk_h0_leaf_f32(
     volume: &ScalarTiffStackReader,
     slab_id: usize,
@@ -2284,6 +2554,651 @@ fn reduce_disk_h0_root<K: DiskScalarKey>(
     })
 }
 
+/// Compact native-U16 hierarchical H0 persistence path.
+fn compute_h0_persistence_scalar_hierarchical_stream_u16_zslabs(
+    volume: &ScalarTiffStackReader,
+    slab_depth: usize,
+    connectivity: Connectivity,
+    output_path: &Path,
+    tuning: ScalarStreamTuning,
+) -> Result<ScalarH0PersistenceStats> {
+    let start = Instant::now();
+    if !matches!(tuning.h0_birth_buffer, H0BirthBufferStrategy::ReuseInput) {
+        bail!("h0-scalar-hierarchical-stream requires --h0-birth-buffer reuse-input");
+    }
+    if !matches!(tuning.h0_event_storage, H0EventStorageStrategy::Direct) {
+        bail!("h0-scalar-hierarchical-stream requires --h0-event-storage direct");
+    }
+
+    let temp_directory = TempRunDirectory::create("h0_scalar_hierarchical_stream_runs")?;
+    println!(
+        "Scalar hierarchical H0 streaming temporary directory: {:?}",
+        temp_directory.path()
+    );
+    let pairs_path = temp_directory.path().join("h0_hier_finalized_pairs.bin");
+    let mut pair_writer = BufWriter::new(File::create(&pairs_path)?);
+
+    let mut ranges = Vec::new();
+    let mut z0 = 0usize;
+    let mut slab_id = 0usize;
+    while z0 < volume.depth {
+        let z1 = z0.saturating_add(slab_depth).min(volume.depth);
+        ranges.push((slab_id, z0, z1));
+        slab_id += 1;
+        z0 = z1;
+    }
+    let face_size = volume
+        .width
+        .checked_mul(volume.height)
+        .expect("hierarchical H0 face size overflow");
+    let planned_pair_nodes = if ranges.len() > 1 {
+        face_size.saturating_mul(4)
+    } else if volume.depth == 1 {
+        face_size
+    } else {
+        face_size.saturating_mul(2)
+    };
+    let planned_pair_state_bytes = u64::try_from(planned_pair_nodes)
+        .expect("hierarchical H0 planned pair nodes exceed u64")
+        .saturating_mul(8);
+    println!(
+        "Scalar hierarchical H0 storage: pipeline=u16-native32-direct-disk-fanin disk_key_bytes=4 pair_state_bytes_per_node=8 planned_max_pair_nodes={} planned_max_pair_state_bytes={} final_interface_bound={}",
+        planned_pair_nodes,
+        planned_pair_state_bytes,
+        if volume.depth == 1 {
+            face_size
+        } else {
+            face_size.saturating_mul(2)
+        },
+    );
+    println!(
+        "PROFILE_CONFIG scalar_h0_hierarchical_stream f32_key_mode={} interface_order={} event_order={} neighbor_kernel={} representative_active_check={} union_kernel={} h0_pruning_cache={} h0_birth_buffer={} active_state={} interface_state={} uf_layout={} global_h0_uf_layout=packed h0_event_storage={} h0_hier_attach_pruning={}",
+        tuning.f32_key_mode.as_str(),
+        tuning.interface_order.as_str(),
+        tuning.event_order.as_str(),
+        tuning.neighbor_kernel.as_str(),
+        tuning.representative_active_check.as_str(),
+        tuning.union_kernel.as_str(),
+        tuning.h0_pruning_cache.as_str(),
+        tuning.h0_birth_buffer.as_str(),
+        tuning.active_state.as_str(),
+        tuning.interface_state.as_str(),
+        tuning.uf_layout.as_str(),
+        tuning.h0_event_storage.as_str(),
+        tuning.h0_hier_attach_pruning.as_str(),
+    );
+
+    let mut slots: Vec<Option<DiskHierarchicalH0Summary<U16Key>>> = Vec::new();
+    let mut next_summary_id = ranges.len();
+    let mut combines = 0usize;
+    let mut max_live_summaries = 0usize;
+    let mut max_pair_nodes = 0usize;
+    let mut max_pair_state_bytes = 0u64;
+    let mut attach_finalized_early_total = 0u64;
+    let mut attach_propagated_total = 0u64;
+    let mut leaf_zero_persistence_pairs_elided = 0u64;
+    let mut leaf_successful_unions = 0u64;
+    let mut leaf_union_attempts = 0u64;
+    let mut leaf_scalar_order_seconds = 0.0f64;
+    let mut leaf_local_sweep_seconds = 0.0f64;
+    let mut final_children: Option<(
+        DiskHierarchicalH0Summary<U16Key>,
+        DiskHierarchicalH0Summary<U16Key>,
+    )> = None;
+
+    let leaf_workers = persistence_h0_leaf_workers(volume, slab_depth);
+    let mut leaf_batch_seconds = 0.0f64;
+    let mut leaf_profile_work_seconds = 0.0f64;
+    let mut leaf_buffered_pairs_peak = 0usize;
+    println!(
+        "Scalar hierarchical H0 U16 leaf preparation: workers={} budget_mb={}",
+        leaf_workers,
+        std::env::var("BETTI_PERSIST_H0_LEAF_BUDGET_MB")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(DEFAULT_PERSIST_H0_LEAF_BUDGET_MB),
+    );
+
+    'batch_loop: for batch in ranges.chunks(leaf_workers) {
+        let batch_start = Instant::now();
+        let parallel_results: Vec<Result<BufferedH0U16Leaf>> = batch
+            .par_iter()
+            .map(|&(leaf_id, leaf_z0, leaf_z1)| {
+                prepare_disk_h0_leaf_u16_buffered(
+                    volume,
+                    leaf_id,
+                    leaf_z0,
+                    leaf_z1,
+                    connectivity,
+                    temp_directory.path(),
+                    leaf_id,
+                    tuning,
+                )
+            })
+            .collect();
+        leaf_batch_seconds += batch_start.elapsed().as_secs_f64();
+
+        let mut leaves = parallel_results.into_iter().collect::<Result<Vec<_>>>()?;
+        leaves.sort_by_key(|leaf| leaf.slab_id);
+        leaf_buffered_pairs_peak = leaf_buffered_pairs_peak.max(
+            leaves
+                .iter()
+                .map(|leaf| leaf.finalized_pairs.len())
+                .sum::<usize>(),
+        );
+        leaf_profile_work_seconds += leaves
+            .iter()
+            .map(|leaf| leaf.profile.scalar_order_seconds + leaf.profile.local_sweep_seconds)
+            .sum::<f64>();
+
+        for leaf in leaves {
+            let leaf_id = leaf.slab_id;
+            for pair in leaf.finalized_pairs {
+                write_finite_pair(&mut pair_writer, pair)?;
+            }
+            let profile = leaf.profile;
+            leaf_zero_persistence_pairs_elided += profile.zero_persistence_pairs_elided;
+            leaf_successful_unions += profile.successful_unions;
+            leaf_union_attempts += profile.union_attempts;
+            leaf_scalar_order_seconds += profile.scalar_order_seconds;
+            leaf_local_sweep_seconds += profile.local_sweep_seconds;
+
+            let mut current = leaf.summary;
+            let mut level = 0usize;
+            loop {
+                if level == slots.len() {
+                    slots.push(Some(current));
+                    break;
+                }
+                if let Some(left) = slots[level].take() {
+                    let covers_entire_volume = ranges.len() > 1
+                        && leaf_id + 1 == ranges.len()
+                        && left.z0 == 0
+                        && current.z1 == volume.depth;
+                    if covers_entire_volume {
+                        final_children = Some((left, current));
+                        break 'batch_loop;
+                    }
+
+                    println!(
+                        "Optimized hierarchical H0 fan-in level {level}: z={}..{} + z={}..{}",
+                        left.z0, left.z1, current.z0, current.z1,
+                    );
+                    let (
+                        parent,
+                        pair_nodes,
+                        pair_state_bytes,
+                        attach_finalized_early,
+                        attach_propagated,
+                    ) = combine_disk_h0_summaries(
+                        left,
+                        current,
+                        connectivity,
+                        tuning.interface_order,
+                        temp_directory.path(),
+                        next_summary_id,
+                        &mut pair_writer,
+                        tuning.h0_hier_attach_pruning,
+                    )?;
+                    attach_finalized_early_total += attach_finalized_early;
+                    attach_propagated_total += attach_propagated;
+                    next_summary_id += 1;
+                    combines += 1;
+                    max_pair_nodes = max_pair_nodes.max(pair_nodes);
+                    max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+                    current = parent;
+                    level += 1;
+                } else {
+                    slots[level] = Some(current);
+                    break;
+                }
+            }
+            max_live_summaries =
+                max_live_summaries.max(slots.iter().filter(|slot| slot.is_some()).count());
+        }
+    }
+
+    let mut root_fallback: Option<DiskHierarchicalH0Summary<U16Key>> = None;
+    if final_children.is_none() {
+        let mut remaining: Vec<_> = slots.into_iter().flatten().collect();
+        if remaining.is_empty() {
+            bail!("hierarchical H0 stream received an empty volume");
+        }
+        remaining.sort_by_key(|summary| summary.z0);
+
+        if remaining.len() == 1 {
+            // Single-slab volumes have no pairwise fan-in to intercept. Keep
+            // the existing root reducer as the exact fallback for this case.
+            root_fallback = remaining.pop();
+        } else {
+            let mut left = remaining.remove(0);
+            while remaining.len() > 1 {
+                let right = remaining.remove(0);
+                let (
+                    parent,
+                    pair_nodes,
+                    pair_state_bytes,
+                    attach_finalized_early,
+                    attach_propagated,
+                ) = combine_disk_h0_summaries(
+                    left,
+                    right,
+                    connectivity,
+                    tuning.interface_order,
+                    temp_directory.path(),
+                    next_summary_id,
+                    &mut pair_writer,
+                    tuning.h0_hier_attach_pruning,
+                )?;
+                attach_finalized_early_total += attach_finalized_early;
+                attach_propagated_total += attach_propagated;
+                next_summary_id += 1;
+                combines += 1;
+                max_pair_nodes = max_pair_nodes.max(pair_nodes);
+                max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+                left = parent;
+            }
+            let right = remaining
+                .pop()
+                .expect("hierarchical H0 final child unexpectedly missing");
+            final_children = Some((left, right));
+        }
+    }
+
+    let mut terminal_free_result: Option<(Vec<U16Key>, usize, u64)> = None;
+    if let Some((left, right)) = final_children {
+        println!(
+            "Optimized hierarchical H0 terminal-free final fan-in: z={}..{} + z={}..{}",
+            left.z0, left.z1, right.z0, right.z1,
+        );
+        let (essential_births, pair_nodes, pair_state_bytes) = finalize_disk_h0_pair(
+            left,
+            right,
+            connectivity,
+            tuning.interface_order,
+            temp_directory.path(),
+            next_summary_id,
+            &mut pair_writer,
+        )?;
+        combines += 1;
+        max_pair_nodes = max_pair_nodes.max(pair_nodes);
+        max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+        terminal_free_result = Some((essential_births, pair_nodes, pair_state_bytes));
+    }
+
+    pair_writer.flush()?;
+    drop(pair_writer);
+    let finalized_pair_bytes = path_len(&pairs_path)?;
+    println!(
+        "PROFILE_U16_PERSIST_H0_PARALLEL leaf_workers={} leaf_batch_seconds={:.6} leaf_profile_work_seconds={:.6} buffered_pairs_peak={}",
+        leaf_workers, leaf_batch_seconds, leaf_profile_work_seconds, leaf_buffered_pairs_peak,
+    );
+    println!(
+        "PROFILE_U16_PERSIST_LEAF dimension=h0 key_bytes=4 zero_persistence_pairs_elided={} union_attempts={} successful_unions={} scalar_order_seconds={:.6} local_sweep_seconds={:.6}",
+        leaf_zero_persistence_pairs_elided,
+        leaf_union_attempts,
+        leaf_successful_unions,
+        leaf_scalar_order_seconds,
+        leaf_local_sweep_seconds,
+    );
+
+    let stats = if let Some((essential_births, final_pair_nodes, final_pair_state_bytes)) =
+        terminal_free_result
+    {
+        println!(
+            "PROFILE_H0_HIER_STREAM leaf_slabs={} combines={} max_live_summaries={} max_pair_nodes={} max_pair_state_bytes={} final_interface_nodes=0 finalized_pair_bytes={} root_attach_bytes=0 root_interface_bytes=0 final_pair_nodes={} final_pair_state_bytes={} root_materialized=false disk_key_bytes=4 h0_birth_buffer=reuse-input h0_event_storage=direct global_h0_uf_layout=packed attach_finalized_early={} attach_propagated={} h0_hier_attach_pruning={}",
+            ranges.len(),
+            combines,
+            max_live_summaries,
+            max_pair_nodes,
+            max_pair_state_bytes,
+            finalized_pair_bytes,
+            final_pair_nodes,
+            final_pair_state_bytes,
+            attach_finalized_early_total,
+            attach_propagated_total,
+            tuning.h0_hier_attach_pruning.as_str(),
+        );
+
+        let mut output = AtomicOutput::create(output_path)?;
+        writeln!(output, "birth,death")?;
+        let mut finite_intervals = 0u64;
+        let mut pair_reader = BufReader::new(File::open(&pairs_path)?);
+        while let Some(pair) = read_finite_pair::<U16Key>(&mut pair_reader)? {
+            if write_pair_csv(&mut output, pair)? {
+                finite_intervals += 1;
+            }
+        }
+        for birth in &essential_births {
+            writeln!(output, "{},inf", birth.widen())?;
+        }
+        output.commit()?;
+        ScalarH0PersistenceStats {
+            finite_intervals,
+            essential_intervals: essential_births.len() as u64,
+        }
+    } else {
+        let root = root_fallback
+            .ok_or_else(|| anyhow::anyhow!("hierarchical H0 final root unexpectedly missing"))?;
+        let root_attach_bytes = path_len(&root.attach_path)?;
+        let root_interface_bytes = path_len(&root.interface_path)?;
+        println!(
+            "PROFILE_H0_HIER_STREAM leaf_slabs={} combines={} max_live_summaries={} max_pair_nodes={} max_pair_state_bytes={} final_interface_nodes={} finalized_pair_bytes={} root_attach_bytes={} root_interface_bytes={} root_materialized=true disk_key_bytes=4 h0_birth_buffer=reuse-input h0_event_storage=direct global_h0_uf_layout=packed attach_finalized_early={} attach_propagated={} h0_hier_attach_pruning={}",
+            ranges.len(),
+            combines,
+            max_live_summaries,
+            max_pair_nodes,
+            max_pair_state_bytes,
+            root.interface_node_count,
+            finalized_pair_bytes,
+            root_attach_bytes,
+            root_interface_bytes,
+            attach_finalized_early_total,
+            attach_propagated_total,
+            tuning.h0_hier_attach_pruning.as_str(),
+        );
+        reduce_disk_h0_root(root, &pairs_path, output_path)?
+    };
+
+    let total_seconds = start.elapsed().as_secs_f64();
+    println!("PROFILE scalar_h0_hierarchical_stream total_seconds={total_seconds:.6}");
+    temp_directory.close()?;
+    Ok(stats)
+}
+
+fn compute_h0_persistence_scalar_hierarchical_stream_wide_zslabs(
+    volume: &ScalarTiffStackReader,
+    slab_depth: usize,
+    connectivity: Connectivity,
+    output_path: &Path,
+    tuning: ScalarStreamTuning,
+) -> Result<ScalarH0PersistenceStats> {
+    let start = Instant::now();
+    if !matches!(tuning.h0_birth_buffer, H0BirthBufferStrategy::ReuseInput) {
+        bail!("h0-scalar-hierarchical-stream requires --h0-birth-buffer reuse-input");
+    }
+    if !matches!(tuning.h0_event_storage, H0EventStorageStrategy::Direct) {
+        bail!("h0-scalar-hierarchical-stream requires --h0-event-storage direct");
+    }
+
+    let temp_directory = TempRunDirectory::create("h0_scalar_hierarchical_stream_runs")?;
+    println!(
+        "Scalar hierarchical H0 streaming temporary directory: {:?}",
+        temp_directory.path()
+    );
+    let pairs_path = temp_directory.path().join("h0_hier_finalized_pairs.bin");
+    let mut pair_writer = BufWriter::new(File::create(&pairs_path)?);
+
+    let mut ranges = Vec::new();
+    let mut z0 = 0usize;
+    let mut slab_id = 0usize;
+    while z0 < volume.depth {
+        let z1 = z0.saturating_add(slab_depth).min(volume.depth);
+        ranges.push((slab_id, z0, z1));
+        slab_id += 1;
+        z0 = z1;
+    }
+    let face_size = volume
+        .width
+        .checked_mul(volume.height)
+        .expect("hierarchical H0 face size overflow");
+    let planned_pair_nodes = if ranges.len() > 1 {
+        face_size.saturating_mul(4)
+    } else if volume.depth == 1 {
+        face_size
+    } else {
+        face_size.saturating_mul(2)
+    };
+    let planned_pair_state_bytes = u64::try_from(planned_pair_nodes)
+        .expect("hierarchical H0 planned pair nodes exceed u64")
+        .saturating_mul(8);
+    println!(
+        "Scalar hierarchical H0 storage: pipeline=wide64-direct-disk-fanin disk_key_bytes=8 pair_state_bytes_per_node=8 planned_max_pair_nodes={} planned_max_pair_state_bytes={} final_interface_bound={}",
+        planned_pair_nodes,
+        planned_pair_state_bytes,
+        if volume.depth == 1 {
+            face_size
+        } else {
+            face_size.saturating_mul(2)
+        },
+    );
+    println!(
+        "PROFILE_CONFIG scalar_h0_hierarchical_stream f32_key_mode={} interface_order={} event_order={} neighbor_kernel={} representative_active_check={} union_kernel={} h0_pruning_cache={} h0_birth_buffer={} active_state={} interface_state={} uf_layout={} global_h0_uf_layout=packed h0_event_storage={} h0_hier_attach_pruning={}",
+        tuning.f32_key_mode.as_str(),
+        tuning.interface_order.as_str(),
+        tuning.event_order.as_str(),
+        tuning.neighbor_kernel.as_str(),
+        tuning.representative_active_check.as_str(),
+        tuning.union_kernel.as_str(),
+        tuning.h0_pruning_cache.as_str(),
+        tuning.h0_birth_buffer.as_str(),
+        tuning.active_state.as_str(),
+        tuning.interface_state.as_str(),
+        tuning.uf_layout.as_str(),
+        tuning.h0_event_storage.as_str(),
+        tuning.h0_hier_attach_pruning.as_str(),
+    );
+
+    let mut slots: Vec<Option<DiskHierarchicalH0Summary<ScalarKey>>> = Vec::new();
+    let mut next_summary_id = ranges.len();
+    let mut combines = 0usize;
+    let mut max_live_summaries = 0usize;
+    let mut max_pair_nodes = 0usize;
+    let mut max_pair_state_bytes = 0u64;
+    let mut attach_finalized_early_total = 0u64;
+    let mut attach_propagated_total = 0u64;
+    let mut final_children: Option<(
+        DiskHierarchicalH0Summary<ScalarKey>,
+        DiskHierarchicalH0Summary<ScalarKey>,
+    )> = None;
+
+    'leaf_loop: for &(leaf_id, leaf_z0, leaf_z1) in &ranges {
+        println!("Preparing optimized hierarchical H0 leaf {leaf_id}: z={leaf_z0}..{leaf_z1}");
+        let (mut current, _profile) = prepare_disk_h0_leaf_scalar(
+            volume,
+            leaf_id,
+            leaf_z0,
+            leaf_z1,
+            connectivity,
+            temp_directory.path(),
+            leaf_id,
+            &mut pair_writer,
+            tuning,
+        )?;
+        let mut level = 0usize;
+        loop {
+            if level == slots.len() {
+                slots.push(Some(current));
+                break;
+            }
+            if let Some(left) = slots[level].take() {
+                // If these two summaries cover the entire image, do not create
+                // another relative root summary. Keep them as the final two
+                // children and perform a terminal-free persistence reduction
+                // directly after leaf preparation finishes.
+                let covers_entire_volume = ranges.len() > 1
+                    && leaf_id + 1 == ranges.len()
+                    && left.z0 == 0
+                    && current.z1 == volume.depth;
+                if covers_entire_volume {
+                    final_children = Some((left, current));
+                    break 'leaf_loop;
+                }
+
+                println!(
+                    "Optimized hierarchical H0 fan-in level {level}: z={}..{} + z={}..{}",
+                    left.z0, left.z1, current.z0, current.z1,
+                );
+                let (
+                    parent,
+                    pair_nodes,
+                    pair_state_bytes,
+                    attach_finalized_early,
+                    attach_propagated,
+                ) = combine_disk_h0_summaries(
+                    left,
+                    current,
+                    connectivity,
+                    tuning.interface_order,
+                    temp_directory.path(),
+                    next_summary_id,
+                    &mut pair_writer,
+                    tuning.h0_hier_attach_pruning,
+                )?;
+                attach_finalized_early_total += attach_finalized_early;
+                attach_propagated_total += attach_propagated;
+                next_summary_id += 1;
+                combines += 1;
+                max_pair_nodes = max_pair_nodes.max(pair_nodes);
+                max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+                current = parent;
+                level += 1;
+            } else {
+                slots[level] = Some(current);
+                break;
+            }
+        }
+        max_live_summaries =
+            max_live_summaries.max(slots.iter().filter(|slot| slot.is_some()).count());
+    }
+
+    let mut root_fallback: Option<DiskHierarchicalH0Summary<ScalarKey>> = None;
+    if final_children.is_none() {
+        let mut remaining: Vec<_> = slots.into_iter().flatten().collect();
+        if remaining.is_empty() {
+            bail!("hierarchical H0 stream received an empty volume");
+        }
+        remaining.sort_by_key(|summary| summary.z0);
+
+        if remaining.len() == 1 {
+            // Single-slab volumes have no pairwise fan-in to intercept. Keep
+            // the existing root reducer as the exact fallback for this case.
+            root_fallback = remaining.pop();
+        } else {
+            let mut left = remaining.remove(0);
+            while remaining.len() > 1 {
+                let right = remaining.remove(0);
+                let (
+                    parent,
+                    pair_nodes,
+                    pair_state_bytes,
+                    attach_finalized_early,
+                    attach_propagated,
+                ) = combine_disk_h0_summaries(
+                    left,
+                    right,
+                    connectivity,
+                    tuning.interface_order,
+                    temp_directory.path(),
+                    next_summary_id,
+                    &mut pair_writer,
+                    tuning.h0_hier_attach_pruning,
+                )?;
+                attach_finalized_early_total += attach_finalized_early;
+                attach_propagated_total += attach_propagated;
+                next_summary_id += 1;
+                combines += 1;
+                max_pair_nodes = max_pair_nodes.max(pair_nodes);
+                max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+                left = parent;
+            }
+            let right = remaining
+                .pop()
+                .expect("hierarchical H0 final child unexpectedly missing");
+            final_children = Some((left, right));
+        }
+    }
+
+    let mut terminal_free_result: Option<(Vec<ScalarKey>, usize, u64)> = None;
+    if let Some((left, right)) = final_children {
+        println!(
+            "Optimized hierarchical H0 terminal-free final fan-in: z={}..{} + z={}..{}",
+            left.z0, left.z1, right.z0, right.z1,
+        );
+        let (essential_births, pair_nodes, pair_state_bytes) = finalize_disk_h0_pair(
+            left,
+            right,
+            connectivity,
+            tuning.interface_order,
+            temp_directory.path(),
+            next_summary_id,
+            &mut pair_writer,
+        )?;
+        combines += 1;
+        max_pair_nodes = max_pair_nodes.max(pair_nodes);
+        max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+        terminal_free_result = Some((essential_births, pair_nodes, pair_state_bytes));
+    }
+
+    pair_writer.flush()?;
+    drop(pair_writer);
+    let finalized_pair_bytes = path_len(&pairs_path)?;
+
+    let stats = if let Some((essential_births, final_pair_nodes, final_pair_state_bytes)) =
+        terminal_free_result
+    {
+        println!(
+            "PROFILE_H0_HIER_STREAM leaf_slabs={} combines={} max_live_summaries={} max_pair_nodes={} max_pair_state_bytes={} final_interface_nodes=0 finalized_pair_bytes={} root_attach_bytes=0 root_interface_bytes=0 final_pair_nodes={} final_pair_state_bytes={} root_materialized=false disk_key_bytes=8 h0_birth_buffer=reuse-input h0_event_storage=direct global_h0_uf_layout=packed attach_finalized_early={} attach_propagated={} h0_hier_attach_pruning={}",
+            ranges.len(),
+            combines,
+            max_live_summaries,
+            max_pair_nodes,
+            max_pair_state_bytes,
+            finalized_pair_bytes,
+            final_pair_nodes,
+            final_pair_state_bytes,
+            attach_finalized_early_total,
+            attach_propagated_total,
+            tuning.h0_hier_attach_pruning.as_str(),
+        );
+
+        let mut output = AtomicOutput::create(output_path)?;
+        writeln!(output, "birth,death")?;
+        let mut finite_intervals = 0u64;
+        let mut pair_reader = BufReader::new(File::open(&pairs_path)?);
+        while let Some(pair) = read_finite_pair::<ScalarKey>(&mut pair_reader)? {
+            if write_pair_csv(&mut output, pair)? {
+                finite_intervals += 1;
+            }
+        }
+        for birth in &essential_births {
+            writeln!(output, "{},inf", birth.widen())?;
+        }
+        output.commit()?;
+        ScalarH0PersistenceStats {
+            finite_intervals,
+            essential_intervals: essential_births.len() as u64,
+        }
+    } else {
+        let root = root_fallback
+            .ok_or_else(|| anyhow::anyhow!("hierarchical H0 final root unexpectedly missing"))?;
+        let root_attach_bytes = path_len(&root.attach_path)?;
+        let root_interface_bytes = path_len(&root.interface_path)?;
+        println!(
+            "PROFILE_H0_HIER_STREAM leaf_slabs={} combines={} max_live_summaries={} max_pair_nodes={} max_pair_state_bytes={} final_interface_nodes={} finalized_pair_bytes={} root_attach_bytes={} root_interface_bytes={} root_materialized=true disk_key_bytes=8 h0_birth_buffer=reuse-input h0_event_storage=direct global_h0_uf_layout=packed attach_finalized_early={} attach_propagated={} h0_hier_attach_pruning={}",
+            ranges.len(),
+            combines,
+            max_live_summaries,
+            max_pair_nodes,
+            max_pair_state_bytes,
+            root.interface_node_count,
+            finalized_pair_bytes,
+            root_attach_bytes,
+            root_interface_bytes,
+            attach_finalized_early_total,
+            attach_propagated_total,
+            tuning.h0_hier_attach_pruning.as_str(),
+        );
+        reduce_disk_h0_root(root, &pairs_path, output_path)?
+    };
+
+    let total_seconds = start.elapsed().as_secs_f64();
+    println!("PROFILE scalar_h0_hierarchical_stream total_seconds={total_seconds:.6}");
+    temp_directory.close()?;
+    Ok(stats)
+}
+
 pub fn compute_h0_persistence_scalar_hierarchical_stream_zslabs(
     volume: &ScalarTiffStackReader,
     slab_depth: usize,
@@ -2292,6 +3207,24 @@ pub fn compute_h0_persistence_scalar_hierarchical_stream_zslabs(
     tuning: ScalarStreamTuning,
 ) -> Result<ScalarH0PersistenceStats> {
     let start = Instant::now();
+    if volume.pixel_type == ScalarPixelType::U16 && u16_native_persistence_enabled() {
+        return compute_h0_persistence_scalar_hierarchical_stream_u16_zslabs(
+            volume,
+            slab_depth,
+            connectivity,
+            output_path,
+            tuning,
+        );
+    }
+    if volume.pixel_type != ScalarPixelType::F32 {
+        return compute_h0_persistence_scalar_hierarchical_stream_wide_zslabs(
+            volume,
+            slab_depth,
+            connectivity,
+            output_path,
+            tuning,
+        );
+    }
     if volume.pixel_type != ScalarPixelType::F32 || tuning.f32_key_mode != F32KeyMode::Native32 {
         bail!(
             "h0-scalar-hierarchical-stream currently requires an F32 TIFF stack with --f32-key-mode native32"

@@ -99,6 +99,69 @@ impl LocalUnionFindState {
         node != root && !self.is_root(node) && self.parent[node as usize] == root
     }
 
+    /// Return the already-stored parent for a non-root node.
+    ///
+    /// This is used by the cached-find H2 hot path so the parent word loaded for
+    /// the direct-parent check can be reused by path halving instead of being
+    /// fetched again inside `find`. `None` means that `node` is already a root.
+    #[inline]
+    pub(crate) fn parent_if_nonroot(&self, node: u32) -> Option<u32> {
+        let word = self.parent[node as usize];
+        debug_assert_ne!(word, INACTIVE_WORD);
+        match self.layout {
+            UnionFindLayoutStrategy::ParentRank => (word != node).then_some(word),
+            UnionFindLayoutStrategy::Packed => {
+                if Self::packed_word_is_root(word) {
+                    None
+                } else {
+                    Some(word)
+                }
+            }
+        }
+    }
+
+    /// Returns true only when `root` is exactly two parent edges above `node`.
+    ///
+    /// This is a read-only hot-path shortcut: it never performs path compression
+    /// and is valid for both parent-rank and packed layouts. Packed roots store a
+    /// tagged rank word in their own parent slot, so we must not index through a
+    /// parent that is already a root.
+    #[inline]
+    pub(crate) fn grandparent_is(&self, node: u32, root: u32) -> bool {
+        if node == root || self.is_root(node) {
+            return false;
+        }
+        let parent = self.parent[node as usize];
+        if parent == root || self.is_root(parent) {
+            return false;
+        }
+        self.parent[parent as usize] == root
+    }
+
+    /// Continue path-halving find after the caller has already loaded the first
+    /// parent of a known non-root node. This preserves the same path-halving
+    /// updates and step count as `find(node)` while avoiding the duplicate
+    /// initial root/parent load in the caller+find sequence.
+    #[inline]
+    pub(crate) fn find_from_known_parent(&mut self, mut node: u32, mut parent: u32) -> (u32, u64) {
+        debug_assert_eq!(self.parent_if_nonroot(node), Some(parent));
+        let mut steps = 1u64;
+        loop {
+            if self.is_root(parent) {
+                return (parent, steps);
+            }
+            let grandparent = self.parent[parent as usize];
+            debug_assert!(
+                grandparent < PACKED_ROOT_TAG
+                    || matches!(self.layout, UnionFindLayoutStrategy::ParentRank)
+            );
+            self.parent[node as usize] = grandparent;
+            node = parent;
+            parent = grandparent;
+            steps += 1;
+        }
+    }
+
     /// Find with path halving. Returns `(root, parent_edges_traversed)`.
     pub(crate) fn find(&mut self, mut node: u32) -> (u32, u64) {
         debug_assert!(self.parent[node as usize] != INACTIVE_WORD);
@@ -236,6 +299,76 @@ mod tests {
             UnionFindLayoutStrategy::Packed,
             ActiveStateStrategy::ParentSentinel,
         );
+    }
+
+    fn exercise_grandparent(layout: UnionFindLayoutStrategy, active: ActiveStateStrategy) {
+        let mut uf = LocalUnionFindState::new(4, active, layout);
+        if matches!(active, ActiveStateStrategy::ParentSentinel) {
+            for node in 0..4u32 {
+                uf.activate(node);
+            }
+        }
+        uf.link_root_under(2, 1);
+        uf.link_root_under(1, 0);
+        assert!(!uf.direct_parent_is(2, 0));
+        assert!(uf.grandparent_is(2, 0));
+        assert!(!uf.grandparent_is(1, 0));
+        assert!(!uf.grandparent_is(0, 0));
+        assert!(!uf.grandparent_is(3, 0));
+    }
+
+    #[test]
+    fn grandparent_shortcut_works_for_all_local_uf_layouts() {
+        for layout in [
+            UnionFindLayoutStrategy::ParentRank,
+            UnionFindLayoutStrategy::Packed,
+        ] {
+            for active in [
+                ActiveStateStrategy::Separate,
+                ActiveStateStrategy::ParentSentinel,
+            ] {
+                exercise_grandparent(layout, active);
+            }
+        }
+    }
+
+    fn exercise_cached_find(layout: UnionFindLayoutStrategy, active: ActiveStateStrategy) {
+        let mut uf = LocalUnionFindState::new(6, active, layout);
+        if matches!(active, ActiveStateStrategy::ParentSentinel) {
+            for node in 0..6u32 {
+                uf.activate(node);
+            }
+        }
+
+        uf.link_root_under(3, 2);
+        uf.link_root_under(2, 1);
+        uf.link_root_under(1, 0);
+
+        assert_eq!(uf.parent_if_nonroot(0), None);
+        let first_parent = uf.parent_if_nonroot(3).expect("3 must be non-root");
+        assert_eq!(first_parent, 2);
+        let (root, steps) = uf.find_from_known_parent(3, first_parent);
+        assert_eq!(root, 0);
+        assert_eq!(steps, 3);
+
+        let (root_again, steps_again) = uf.find(3);
+        assert_eq!(root_again, 0);
+        assert!(steps_again <= 2);
+    }
+
+    #[test]
+    fn cached_parent_find_works_for_all_local_uf_layouts() {
+        for layout in [
+            UnionFindLayoutStrategy::ParentRank,
+            UnionFindLayoutStrategy::Packed,
+        ] {
+            for active in [
+                ActiveStateStrategy::Separate,
+                ActiveStateStrategy::ParentSentinel,
+            ] {
+                exercise_cached_find(layout, active);
+            }
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@ The public README table is generated from `benchmarks/data/published_results.csv
 - `cx09t1_h2_cross_storage_summary.csv`: H2 direct-cross ablation.
 - `cx09t1_h2_outside_structural_pruning_summary.csv`: H2 outside-structural-pruning ablation.
 - `t1_s26_h0_real_prefix.csv`: 64- and 128-slice prefixes of a real 3792×3792 F32 synchrotron stack.
+- `v23_5_2_confirmation/`: 35-pair blocked d16 confirmation that promoted the U16 H2 fast root-invariant interface query in v23.6; includes raw runs, pair/block summaries, and the pre-registered decision record.
 
 Historical runs did not record `RAYON_NUM_THREADS`. They are therefore marked `not recorded`; the benchmark runner added for the public repository always records the requested thread count.
 

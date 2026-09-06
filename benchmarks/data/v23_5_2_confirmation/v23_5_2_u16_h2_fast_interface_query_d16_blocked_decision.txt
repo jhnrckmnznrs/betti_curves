@@ -1,0 +1,22 @@
+v23.5.2 blocked fast-interface-query confirmation
+verdict=PROMOTE_CANDIDATE
+perf_status=UNAVAILABLE
+
+pairs=35 blocks=5 pairs_per_block=7
+median_wall_delta_pct=-1.518526
+median_local_sweep_delta_pct=-1.750983
+candidate_faster_wall_pairs=29/35
+two_sided_sign_test_p_wall=0.000116842
+negative_wall_median_blocks=4/5
+reference_first_median_wall_delta_pct=-1.126478
+candidate_first_median_wall_delta_pct=-1.747315
+
+pre_registered_checks:
+  design_is_5x7=PASS
+  median_wall_is_faster=PASS
+  median_local_sweep_is_faster=PASS
+  wall_wins_at_least_24_of_35=PASS
+  wall_sign_test_p_lt_0_05=PASS
+  at_least_4_of_5_blocks_have_negative_wall_median=PASS
+  reference_first_median_is_faster=PASS
+  candidate_first_median_is_faster=PASS

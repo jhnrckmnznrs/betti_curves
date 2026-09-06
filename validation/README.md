@@ -254,3 +254,27 @@ conversion is exact.
 ## v1.21 optimized hierarchical H0
 
 `check_scalar_h0_hierarchical_stream_equivalence.py` stages an exact-value F32 CX09T1 fixture and compares in-memory H0, flat native32/direct streaming H0, and `h0-scalar-hierarchical-stream`. In addition to exact persistence equality, it checks the measured pair frontier is at most four face areas, the final interface state is two face areas for a multi-slice fixture, and the disk key width is four bytes.
+
+
+## v23.6 fast-interface production freeze
+
+The promoted native-U16 H2 fast root-invariant interface query is default-on.
+The release gate verifies both the old and new arithmetic paths and separately
+checks default behavior so an accidental environment-toggle regression cannot
+pass unnoticed.
+
+After `scripts/prepare_for_commit.sh`, run:
+
+```bash
+scripts/check_u16_h2_fast_interface_query_v23_6_freeze.sh \
+  examples/CX09T1 \
+  target/release/betti_curves
+```
+
+This runs the independent arithmetic oracle, exact ordered OFF-vs-ON persistence
+equivalence at slab depths 16/32/64, and a d16 default-state check requiring:
+
+- environment variable unset => `h2_fast_interface_query=on`;
+- explicit `BETTI_PERSIST_H2_FAST_INTERFACE_QUERY=1` => on;
+- explicit `BETTI_PERSIST_H2_FAST_INTERFACE_QUERY=0` => off;
+- identical ordered persistence rows for default, explicit-on, and reference-off.

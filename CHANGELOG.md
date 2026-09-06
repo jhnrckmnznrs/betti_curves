@@ -1,3 +1,117 @@
+## v23.6 frozen checkpoint — U16 H2 production profile
+
+- Froze the confirmed native-U16 H2 production profile described in `V23_6_FREEZE.md`.
+- Corrected `V23_6_RUN_COMMANDS.txt` to include the mandatory compact local/global H2 birth-state and packed global-UF flags plus the benchmarked direct-cross/outside-dominated hierarchy settings.
+- Added the CX09T1 frozen output under `benchmarks/data/v23_6_freeze/` with SHA-256 `6f08ac4bf5b2d155724d28b1d23dd6c4697ff53f707e5fd4786795f63a3744e6`.
+- No Rust algorithm change relative to the v23.6 production-consolidation code.
+
+## v23.6 production consolidation — promoted U16 H2 fast interface query
+
+- Promoted the v23.5 fast root-invariant interface query to the native-U16 H2 production default after the pre-registered v23.5.2 blocked confirmation passed all timing gates.
+- The 5×7 d16 confirmation produced a median wall-time delta of **-1.52%**, a median local-sweep delta of **-1.75%**, **29/35** candidate wall-time wins, exact two-sided sign-test **p=0.000116842**, and negative wall medians in **4/5** blocks and both run-order strata.
+- `BETTI_PERSIST_H2_FAST_INTERFACE_QUERY` is now default-on. Set it to `0`, `false`, `off`, or `no` to restore the exact division/remainder reference path for regression/ablation work.
+- Kept native-U16 H2 root dedup opt-in-only, `parent-two-hop` experimental/rejected for production, and `parent-cached-find` experimental/neutral; the production neighbor-root strategy remains `parent-shortcut`.
+- Preserved the complete v23.5.2 blocked confirmation under `benchmarks/data/v23_5_2_confirmation/`, including the decision file and raw paired/block summaries. Hardware `perf` counters were unavailable on that host and were not a promotion requirement.
+- Added a production-default regression gate that verifies: unset fast-interface environment => ON; explicit `=1` => ON; explicit `=0` => reference OFF; and exact ordered persistence equivalence between all three states on the representative U16 stack.
+- Moved historical v23.2-v23.5.1 root-level run-command sheets into `docs/development/run_commands/`; only the current `V23_6_RUN_COMMANDS.txt` remains at repository root.
+- Kept the Cargo package version at `0.2.0` for this internal freeze checkpoint. The tree also contains other unreleased feature-level work, so the next public semantic-version tag should be chosen only when that broader release scope is reviewed.
+
+## v23.5.2 experimental — blocked d16 confirmation with optional perf counters
+
+- Kept the v23.5 fast-interface-query Rust implementation unchanged and preserved `BETTI_PERSIST_H2_FAST_INTERFACE_QUERY=0` as the source default.
+- Recorded the v23.5.1 31-pair d16 confirmation as inconclusive: its paired median still favored the candidate, but pair-to-pair wall/sweep variability was much larger than the expected ~1–2% effect and the pre-registered win/sign-test gate did not pass.
+- Replaced one long sequence with a pre-registered blocked design: five blocks, seven measured pairs per block, one warmup pair per block, alternating A/B order, and a 10 s cooldown between blocks.
+- Added optional `perf stat` collection (`cycles`, `instructions`, `branches`, `branch-misses`) plus `/proc/loadavg` and available CPU-frequency snapshots. `perf` is auto-probed; lack of permission does not invalidate the timing experiment.
+- The timing promotion gate requires: 35 pairs in a 5x7 design; negative median wall and local-sweep deltas; at least 24/35 wall wins; exact two-sided wall sign-test p<0.05; at least four of five block wall medians negative; and negative wall medians in both order strata. Perf counters are corroborating evidence, not a hard requirement.
+- Added `scripts/profile_u16_h2_fast_interface_query_blocked.py`, `scripts/evaluate_u16_h2_fast_interface_query_blocked.py`, and `scripts/confirm_u16_h2_fast_interface_query_v23_5_2.sh`.
+- Preserved the complete v23.5.1 confirmation outputs under `benchmarks/data/v23_5_1_confirmation/`.
+
+## v23.5.1 experimental — focused d16 confirmation gate
+
+- Kept the v23.5 fast-interface-query implementation unchanged and preserved `BETTI_PERSIST_H2_FAST_INTERFACE_QUERY=0` as the source default pending confirmation.
+- Recorded the first 11-pair/depth A/B result as promising: d16 median wall/local-sweep deltas were about -1.43%/-2.09%, with 9/11 wall wins; d32 and d64 also pointed in the same direction.
+- Added a pre-registered d16-only confirmation protocol with 31 alternating reference/candidate pairs and no sweep diagnostics.
+- The promotion gate requires: exact d16/d32/d64 persistence equivalence; negative d16 median wall and local-sweep deltas; at least 23/31 non-tied wall wins; exact two-sided wall sign-test p<0.05; and negative median wall deltas in both run-order strata.
+- Added `scripts/confirm_u16_h2_fast_interface_query_v23_5_1.sh` and `scripts/evaluate_u16_h2_fast_interface_query_confirmation.py`. The evaluator records a recommendation only; it does not flip production defaults.
+- Preserved the initial v23.5 paired CSVs under `benchmarks/data/` as pre-confirmation evidence.
+
+## v23.5 experimental — U16 H2 fast root-invariant interface query
+
+- Interpreted the v23.4 sampled three-region timing split as timer-overhead dominated and retained only its exact operation counters as optimization evidence.
+- The d16/CX09T1 exact audit recorded 71,472,296 interface-representative queries, making root-invariant interface classification a substantially larger target than the previous sub-million zero-hop-find candidate.
+- Added `BETTI_PERSIST_H2_FAST_INTERFACE_QUERY=1`, which replaces per-query division/remainder with a precomputed upper-face offset plus lower/upper range comparisons and subtraction while preserving the root-invariant interface semantics. The reference/default remains off until A/B validation passes.
+- Added a Rust equivalence unit test, an independent randomized arithmetic model, exact d16/d32/d64 persistence equivalence, and an interleaved paired benchmark.
+- Preserved the v23.4 structural CSVs under `benchmarks/data/`.
+
+## v23.4 experimental — U16 H2 structural sweep profiling
+
+- Kept the production U16 H2 leaf algorithm unchanged: slab depth 16, `parent-shortcut`, and native-U16 root deduplication off.
+- Recorded the v23.3 cached-parent result as a neutral/depth-specific micro-optimization rather than promoting it: d16 remained slightly slower, d32 showed a small suggestive gain, and d64 was neutral.
+- Added deterministic hashed ~1/1024 voxel sampling under `--sweep-diagnostics` to time three contiguous local-sweep regions without calling `Instant::now()` for every voxel: activation/boundary/interface bookkeeping; neighborhood construction/pruning; and union/persistence/event emission.
+- Added exact U16 hierarchical sweep aggregates for active-state checks/hits, representatives, pruning-cache behavior, component-mask computations, interface-state operations, and final/attach/outside/interface event counts.
+- Added `scripts/profile_u16_h2_sweep_structure.py` and `scripts/check_u16_h2_sweep_structure.sh` for a one-run d16/CX09T1 structural diagnosis.
+- Preserved the v23.3 paired and diagnostic CSVs under `benchmarks/data/` as optimization provenance.
+
+## v23.3 experimental — U16 H2 cached-parent fallback find
+
+- Kept `parent-shortcut` as the production/default H2 root-carrying path; v23.2 diagnostics showed that unconditional extra-hop checks are not profitable.
+- Added `--neighbor-root-check parent-cached-find`, which reuses the first parent word already loaded by the direct-parent probe when a fallback find is necessary.
+- Added `LocalUnionFindState::find_from_known_parent`, preserving the same path-halving updates and traversed-edge count as ordinary `find` while avoiding a duplicate initial parent/root load.
+- Root neighbors discovered by the parent probe bypass the zero-hop `find` entirely.
+- Added randomized exact path-halving-state validation, d16/d32/d64 persistence equivalence, and an interleaved paired profiler with a separate diagnostics pass.
+- Root dedup remains opt-in-only and is forced off in this experiment.
+
+## v23.2.1 experimental — two-hop profiler diagnostics fix
+
+- Corrected the v23.2 profiling harness: paired timing remains intentionally uninstrumented, while path-depth/two-hop counters are now collected in a separate `--sweep-diagnostics` pass so diagnostics cannot perturb the timing comparison.
+- Added `scripts/diagnose_u16_h2_two_hop_parent_shortcut.py` for a cheap diagnostic-only rerun after an existing timing experiment.
+- The original v23.2 timing CSVs remain valid for performance comparison; only their zero-valued diagnostic counters were non-informative.
+
+## v23.2 experimental — U16 H2 two-hop parent shortcut
+
+- Restored native-U16 H2 root deduplication to opt-in-only after the paired v23.1 CX09T1 benchmark showed reproducible wall/local-sweep regressions despite eliminating about 66% of nominal union attempts.
+- Added `--neighbor-root-check parent-two-hop`: after the existing current-root/direct-parent checks miss, inspect one grandparent link before falling back to `find(neighbor)`. The production default remains `parent-shortcut`.
+- Added exact two-hop support for both parent-rank and packed local union-find layouts without path compression in the shortcut itself.
+- Added neighbor-find path-depth diagnostics and same-root fallback depth buckets, plus two-hop check/hit counters in the native-U16 H2 leaf profile.
+- Added d16/d32/d64 exact persistence equivalence validation and an interleaved 11-pair/depth reference-vs-candidate profiler with robust paired statistics.
+- Preserved the v23.1 paired root-dedup CSVs under `benchmarks/data/` as negative optimization provenance.
+
+## v23 experimental — U16 H2 exact persistence root deduplication
+
+- Native-U16 hierarchical H2 persistence now resolves representative-neighbor UF roots before center-edge insertion and retains only the first representative of each distinct pre-existing root.
+- Duplicate-root edges are exact same-component no-ops; first-occurrence order is preserved, so persistence action ordering and Outside/interface semantics are unchanged.
+- Added unconditional hot-path union counters for this experiment, fixing the v22 profile's zero-valued union diagnostics when expensive sweep diagnostics are disabled.
+- `BETTI_PERSIST_H2_ROOT_DEDUP=0` restores the v22 no-dedup path in the same binary.
+- Added a randomized symbolic model, exact interval-multiset validator, dedicated d16/d32 A/B profiler, and `docs/u16-h2-root-dedup-persistence.md`.
+- Reworked the v23 performance gate into an interleaved paired d16/d32/d64 design (11 pairs/depth by default) with median/MAD/IQR paired deltas, wall-time CV, and per-pair invariant checks; added a multi-depth exact equivalence/slab-invariance gate and `scripts/check_u16_h2_root_dedup_candidate.sh`.
+- The grouped OFF-then-ON d16/d32 profile is retained only as exploratory evidence and is not sufficient for a production freeze.
+
+## v22 experimental — U16 H2 plateau-zero persistence elision
+
+- Native-U16 hierarchical H2 persistence now discards finite `[t,t)` pairs at the union decision before constructing `FinitePair` or `LocalPersistenceAction` values.
+- The union-find state transition, positive intervals, attach/interface events, and Outside semantics are unchanged.
+- `BETTI_PERSIST_H2_PLATEAU_ZERO_ELISION=0` restores the v21 materialize-and-filter path for exact same-binary A/B validation.
+- Added a randomized symbolic model, exact interval-multiset validator, dedicated d16/d32 profiler, and `docs/u16-h2-plateau-zero-persistence.md`.
+
+## v20.1 experimental
+
+- Remove the unused `z0` field from `U16ScalarBlock` so the native-U16 persistence path remains clean under `cargo clippy -- -D warnings`.
+
+
+## Unreleased — U16 hierarchical persistence candidate
+
+### Experimental v20: native U16 persistence keys
+
+- Added four-byte exact `U16Key` storage for hierarchical U16 H0/H2 persistence, with `65536` reserved as the compact H2 Outside marker.
+- U16 hierarchical persistence now uses native32 keys by default; `BETTI_PERSIST_U16_NATIVE_KEYS=0` restores the v19 wide64 path for same-binary A/B validation.
+- Added exact native32-vs-wide64 interval-multiset validation and a dedicated benchmark script.
+- Added leaf counters for zero-persistence finite pairs that are filtered before output; v20 measures this workload but does not alter plateau semantics.
+
+- Extend `h0-scalar-hierarchical-stream` and `h2-scalar-hierarchical-stream` to non-F32 scalar stacks, including native U16 TIFF input, while preserving the existing F32/native32 path.
+- Reuse decoded scalar slab storage directly in the hierarchical leaf reducer and emit finalized pairs / attach / interface / outside events through monotone direct sinks rather than materializing per-leaf event vectors.
+- Replace the legacy U16 flat cumulative-interface reconciliation with bounded pairwise hierarchical fan-in when the hierarchical modes are selected.
+- Keep the existing `h0-scalar-stream` / `h2-scalar-stream` implementations as independent exact references for equivalence testing.
+- This candidate intentionally keeps the canonical 64-bit `ScalarKey` for U16; native-width integer keys are a follow-up optimization after the hierarchy transfer is measured.
 # Changelog
 
 ## v18 freeze checkpoint — H2 exact UF-root deduplication
@@ -142,3 +256,10 @@ All notable user-facing changes are documented here. This project follows [Seman
 - Keep the 65,536-bucket centralized contractor only for the final root handoff.
 - Add `BETTI_HIER_RECURSIVE_HISTORY=0` to restore the v11 central-only internal-history path for same-binary A/B validation.
 - Add recursive-history profiling counters and a randomized symbolic staging validator.
+
+## Unreleased - U16 H0 persistence parallel leaf preparation
+
+- Prepare native-U16 hierarchical H0 persistence leaves in bounded Rayon batches.
+- Buffer only positive finalized leaf pairs per worker, then hand them off in slab order before deterministic hierarchical fan-in.
+- Add `BETTI_PERSIST_H0_LEAF_WORKERS` and `BETTI_PERSIST_H0_LEAF_BUDGET_MB` controls.
+- Add exact worker-count interval-equivalence validation and a dedicated worker/depth profiler.

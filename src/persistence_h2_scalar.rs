@@ -11,13 +11,13 @@ use crate::atomic_output::AtomicOutput;
 use crate::connectivity::Connectivity;
 use crate::interface_sparsify_scalar::sparsify_scalar_superlevel_interface;
 use crate::io_scalar::{
-    F32ScalarBlock, ScalarBlock, ScalarTiffStackReader, print_scalar_volume_info,
+    F32ScalarBlock, ScalarBlock, ScalarTiffStackReader, U16ScalarBlock, print_scalar_volume_info,
 };
 use crate::local_pruning::{NeighborhoodComponentPruner, NeighborhoodPruningStats};
 use crate::local_uf_state::LocalUnionFindState;
 use crate::memory_audit::{emit as emit_memory_snapshot, vec_capacity_bytes};
-use crate::scalar::{F32Key, LocalScalarKey, ScalarKey};
-use crate::scalar_order::{sorted_f32_indices, sorted_scalar_indices};
+use crate::scalar::{F32Key, LocalScalarKey, ScalarKey, U16Key};
+use crate::scalar_order::{sorted_f32_indices, sorted_scalar_indices, sorted_u16_indices};
 use crate::scalar_stream_tuning::{
     ActiveStateStrategy, GlobalH2BirthStateStrategy, GlobalH2UnionFindLayoutStrategy,
     InterfaceStateStrategy, LocalH2BirthStateStrategy, NeighborKernelStrategy,
@@ -26,9 +26,23 @@ use crate::scalar_stream_tuning::{
 };
 use crate::slab_interface::{
     NO_INTERFACE_REP, face_node_id, interface_node_count as slab_interface_node_count,
-    local_boundary_node_id,
+    local_boundary_node_id, local_boundary_node_id_from_linear_index,
 };
 use crate::tiff_paths::find_tiff_stack_directories;
+
+fn h2_fast_interface_query_enabled_from_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|raw| {
+        raw == "0"
+            || raw.eq_ignore_ascii_case("false")
+            || raw.eq_ignore_ascii_case("off")
+            || raw.eq_ignore_ascii_case("no")
+    })
+}
+
+pub(crate) fn h2_fast_interface_query_enabled() -> bool {
+    let value = std::env::var("BETTI_PERSIST_H2_FAST_INTERFACE_QUERY").ok();
+    h2_fast_interface_query_enabled_from_value(value.as_deref())
+}
 
 /// A foreground H2 persistence interval `[birth, death)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +129,19 @@ pub(crate) struct H2SlabPreparationProfile {
     pub(crate) avoided_find_calls: u64,
     pub(crate) direct_parent_checks: u64,
     pub(crate) direct_parent_hits: u64,
+    pub(crate) two_hop_parent_checks: u64,
+    pub(crate) two_hop_parent_hits: u64,
     pub(crate) avoided_neighbor_find_calls: u64,
+    pub(crate) neighbor_find_calls: u64,
+    pub(crate) neighbor_find_parent_steps: u64,
+    pub(crate) neighbor_find_zero_hop: u64,
+    pub(crate) neighbor_find_one_hop: u64,
+    pub(crate) neighbor_find_two_hop: u64,
+    pub(crate) neighbor_find_gt_two_hop: u64,
+    pub(crate) same_root_neighbor_find_zero_hop: u64,
+    pub(crate) same_root_neighbor_find_one_hop: u64,
+    pub(crate) same_root_neighbor_find_two_hop: u64,
+    pub(crate) same_root_neighbor_find_gt_two_hop: u64,
     pub(crate) interface_rep_queries: u64,
     pub(crate) interface_rep_writes: u64,
     pub(crate) interface_forced_root_unions: u64,
@@ -124,6 +150,42 @@ pub(crate) struct H2SlabPreparationProfile {
     pub(crate) max_rank_observed: u64,
     pub(crate) uf_parent_state_bytes: u64,
     pub(crate) uf_rank_state_bytes: u64,
+    pub(crate) zero_persistence_pairs_elided: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct H2RootDedupProfile {
+    pub(crate) inputs: u64,
+    pub(crate) unique_roots: u64,
+    pub(crate) skipped_duplicate_roots: u64,
+    pub(crate) union_attempts: u64,
+    pub(crate) successful_unions: u64,
+    pub(crate) same_root_unions: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct H2SweepSampleStats {
+    sampled_voxels: u64,
+    sampled_interior_voxels: u64,
+    sampled_boundary_voxels: u64,
+    sampled_representatives: u64,
+    activation_boundary_nanos: u128,
+    neighborhood_pruning_nanos: u128,
+    union_persistence_emit_nanos: u128,
+}
+
+const H2_SWEEP_SAMPLE_STRIDE: u64 = 1 << 10;
+
+#[inline]
+fn h2_sweep_sample(global_linear_index: u64) -> bool {
+    // Deterministic SplitMix64-style hashing avoids periodic alignment with
+    // image rows, slices, slabs, or filtration plateaus. Sampling is only
+    // enabled by --sweep-diagnostics, so production runs pay no Instant cost.
+    let mut x = global_linear_index.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    x & (H2_SWEEP_SAMPLE_STRIDE - 1) == 0
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -139,7 +201,19 @@ struct LocalUnionFindStats {
     avoided_find_calls: u64,
     direct_parent_checks: u64,
     direct_parent_hits: u64,
+    two_hop_parent_checks: u64,
+    two_hop_parent_hits: u64,
     avoided_neighbor_find_calls: u64,
+    neighbor_find_calls: u64,
+    neighbor_find_parent_steps: u64,
+    neighbor_find_zero_hop: u64,
+    neighbor_find_one_hop: u64,
+    neighbor_find_two_hop: u64,
+    neighbor_find_gt_two_hop: u64,
+    same_root_neighbor_find_zero_hop: u64,
+    same_root_neighbor_find_one_hop: u64,
+    same_root_neighbor_find_two_hop: u64,
+    same_root_neighbor_find_gt_two_hop: u64,
     interface_rep_queries: u64,
     interface_rep_writes: u64,
     interface_forced_root_unions: u64,
@@ -323,24 +397,18 @@ fn older_local_background_birth<K: LocalScalarKey>(
     }
 }
 
-fn pair_from_local_background_merge<K: LocalScalarKey>(
+fn younger_local_background_birth<K: LocalScalarKey>(
     a: LocalBackgroundBirth<K>,
     b: LocalBackgroundBirth<K>,
-    merge_value: K,
-) -> Option<FinitePair<K>> {
-    let younger_birth = match (a, b) {
-        (LocalBackgroundBirth::Outside, LocalBackgroundBirth::Outside) => return None,
+) -> Option<K> {
+    match (a, b) {
+        (LocalBackgroundBirth::Outside, LocalBackgroundBirth::Outside) => None,
         (LocalBackgroundBirth::Outside, LocalBackgroundBirth::Finite(value))
-        | (LocalBackgroundBirth::Finite(value), LocalBackgroundBirth::Outside) => value,
+        | (LocalBackgroundBirth::Finite(value), LocalBackgroundBirth::Outside) => Some(value),
         (LocalBackgroundBirth::Finite(a_value), LocalBackgroundBirth::Finite(b_value)) => {
-            a_value.min(b_value)
+            Some(a_value.min(b_value))
         }
-    };
-
-    Some(FinitePair {
-        birth: merge_value,
-        death: younger_birth,
-    })
+    }
 }
 
 #[derive(Debug)]
@@ -349,10 +417,17 @@ struct LocalBackgroundPersistenceUnionFind<K: LocalScalarKey> {
     birth: LocalH2BirthStorage<K>,
     interface_state: InterfaceStateStrategy,
     interface_rep: Option<Vec<u32>>,
+    fast_interface_query: bool,
     slice_size: usize,
+    upper_face_start: usize,
     depth: usize,
     prune_elder_dominated_attaches: bool,
     prune_outside_dominated_structural: bool,
+    plateau_zero_elision: bool,
+    plateau_zero_pairs_early_elided: u64,
+    hot_union_attempts: u64,
+    hot_successful_unions: u64,
+    hot_same_root_unions: u64,
     diagnostics: Option<LocalUnionFindStats>,
 }
 
@@ -376,10 +451,17 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
             birth: LocalH2BirthStorage::new(values, birth_state),
             interface_state,
             interface_rep,
+            fast_interface_query: h2_fast_interface_query_enabled(),
             slice_size: shape[0] * shape[1],
+            upper_face_start: shape[2].saturating_sub(1) * shape[0] * shape[1],
             depth: shape[2],
             prune_elder_dominated_attaches: false,
             prune_outside_dominated_structural: false,
+            plateau_zero_elision: false,
+            plateau_zero_pairs_early_elided: 0,
+            hot_union_attempts: 0,
+            hot_successful_unions: 0,
+            hot_same_root_unions: 0,
             diagnostics: diagnostics.then(LocalUnionFindStats::default),
         }
     }
@@ -395,6 +477,7 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
         birth_state: LocalH2BirthStateStrategy,
         prune_elder_dominated_attaches: bool,
         prune_outside_dominated_structural: bool,
+        plateau_zero_elision: bool,
     ) -> Self {
         let value_count = values.len();
         let uf_state = LocalUnionFindState::new(value_count, active_state, uf_layout);
@@ -405,10 +488,17 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
             birth: LocalH2BirthStorage::new_owned(values, birth_state),
             interface_state,
             interface_rep,
+            fast_interface_query: h2_fast_interface_query_enabled(),
             slice_size: shape[0] * shape[1],
+            upper_face_start: shape[2].saturating_sub(1) * shape[0] * shape[1],
             depth: shape[2],
             prune_elder_dominated_attaches,
             prune_outside_dominated_structural,
+            plateau_zero_elision,
+            plateau_zero_pairs_early_elided: 0,
+            hot_union_attempts: 0,
+            hot_successful_unions: 0,
+            hot_same_root_unions: 0,
             diagnostics: diagnostics.then(LocalUnionFindStats::default),
         }
     }
@@ -426,7 +516,7 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
         self.uf_state.is_active(x)
     }
 
-    fn find(&mut self, x: u32) -> u32 {
+    fn find_with_steps(&mut self, x: u32) -> (u32, u64) {
         if let Some(stats) = self.diagnostics.as_mut() {
             stats.find_calls += 1;
         }
@@ -434,7 +524,46 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
         if let Some(stats) = self.diagnostics.as_mut() {
             stats.find_parent_steps += steps;
         }
-        root
+        (root, steps)
+    }
+
+    #[inline]
+    fn find_from_known_parent_with_steps(&mut self, x: u32, parent: u32) -> (u32, u64) {
+        if let Some(stats) = self.diagnostics.as_mut() {
+            stats.find_calls += 1;
+        }
+        let (root, steps) = self.uf_state.find_from_known_parent(x, parent);
+        if let Some(stats) = self.diagnostics.as_mut() {
+            stats.find_parent_steps += steps;
+        }
+        (root, steps)
+    }
+
+    #[inline]
+    fn find(&mut self, x: u32) -> u32 {
+        self.find_with_steps(x).0
+    }
+
+    #[inline]
+    fn record_neighbor_find(&mut self, steps: u64, same_root: bool) {
+        if let Some(stats) = self.diagnostics.as_mut() {
+            stats.neighbor_find_calls += 1;
+            stats.neighbor_find_parent_steps += steps;
+            match steps {
+                0 => stats.neighbor_find_zero_hop += 1,
+                1 => stats.neighbor_find_one_hop += 1,
+                2 => stats.neighbor_find_two_hop += 1,
+                _ => stats.neighbor_find_gt_two_hop += 1,
+            }
+            if same_root {
+                match steps {
+                    0 => stats.same_root_neighbor_find_zero_hop += 1,
+                    1 => stats.same_root_neighbor_find_one_hop += 1,
+                    2 => stats.same_root_neighbor_find_two_hop += 1,
+                    _ => stats.same_root_neighbor_find_gt_two_hop += 1,
+                }
+            }
+        }
     }
 
     fn record_active_recheck(&mut self, failed: bool) {
@@ -464,10 +593,19 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
                 .expect("vector interface state requires interface_rep")[root as usize],
             InterfaceStateStrategy::RootInvariant => {
                 let index = root as usize;
-                let z = index / self.slice_size;
-                let face_index = index % self.slice_size;
-                local_boundary_node_id(z, self.depth, face_index, self.slice_size)
+                if self.fast_interface_query {
+                    local_boundary_node_id_from_linear_index(
+                        index,
+                        self.slice_size,
+                        self.upper_face_start,
+                    )
                     .unwrap_or(NO_INTERFACE_REP)
+                } else {
+                    let z = index / self.slice_size;
+                    let face_index = index % self.slice_size;
+                    local_boundary_node_id(z, self.depth, face_index, self.slice_size)
+                        .unwrap_or(NO_INTERFACE_REP)
+                }
             }
         }
     }
@@ -543,6 +681,30 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
         self.birth.set(root as usize, LocalBackgroundBirth::Outside);
     }
 
+    #[inline]
+    fn final_pair_action_values(&mut self, birth: K, death: K) -> LocalPersistenceAction<K> {
+        if self.plateau_zero_elision && birth == death {
+            self.plateau_zero_pairs_early_elided += 1;
+            LocalPersistenceAction::None
+        } else {
+            LocalPersistenceAction::FinalPair(FinitePair { birth, death })
+        }
+    }
+
+    #[inline]
+    fn plateau_zero_pairs_early_elided(&self) -> u64 {
+        self.plateau_zero_pairs_early_elided
+    }
+
+    #[inline]
+    fn hot_union_stats(&self) -> (u64, u64, u64) {
+        (
+            self.hot_union_attempts,
+            self.hot_successful_unions,
+            self.hot_same_root_unions,
+        )
+    }
+
     fn merge_known_roots_with_persistence(
         &mut self,
         root_a: u32,
@@ -553,11 +715,13 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
         debug_assert!(self.uf_state.is_root(root_b));
 
         if root_a == root_b {
+            self.hot_same_root_unions += 1;
             if let Some(stats) = self.diagnostics.as_mut() {
                 stats.same_root_unions += 1;
             }
             return (root_a, None);
         }
+        self.hot_successful_unions += 1;
         if let Some(stats) = self.diagnostics.as_mut() {
             stats.successful_unions += 1;
         }
@@ -567,9 +731,10 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
         let rep_a = self.interface_node_for_root(root_a);
         let rep_b = self.interface_node_for_root(root_b);
         let action = match (rep_a != NO_INTERFACE_REP, rep_b != NO_INTERFACE_REP) {
-            (false, false) => pair_from_local_background_merge(birth_a, birth_b, merge_value)
-                .map(LocalPersistenceAction::FinalPair)
-                .unwrap_or(LocalPersistenceAction::None),
+            (false, false) => match younger_local_background_birth(birth_a, birth_b) {
+                Some(death) => self.final_pair_action_values(merge_value, death),
+                None => LocalPersistenceAction::None,
+            },
 
             (true, false) => match birth_b {
                 LocalBackgroundBirth::Finite(branch_birth) => {
@@ -579,10 +744,7 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
                             LocalBackgroundBirth::Finite(root_birth) => root_birth >= branch_birth,
                         };
                     if dominated {
-                        LocalPersistenceAction::FinalPair(FinitePair {
-                            birth: merge_value,
-                            death: branch_birth,
-                        })
+                        self.final_pair_action_values(merge_value, branch_birth)
                     } else {
                         LocalPersistenceAction::Attach(AttachEvent {
                             value: merge_value,
@@ -611,10 +773,7 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
                             LocalBackgroundBirth::Finite(root_birth) => root_birth >= branch_birth,
                         };
                     if dominated {
-                        LocalPersistenceAction::FinalPair(FinitePair {
-                            birth: merge_value,
-                            death: branch_birth,
-                        })
+                        self.final_pair_action_values(merge_value, branch_birth)
                     } else {
                         LocalPersistenceAction::Attach(AttachEvent {
                             value: merge_value,
@@ -696,6 +855,7 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
         b: u32,
         merge_value: K,
     ) -> Option<LocalPersistenceAction<K>> {
+        self.hot_union_attempts += 1;
         if let Some(stats) = self.diagnostics.as_mut() {
             stats.union_attempts += 1;
         }
@@ -713,6 +873,7 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
         neighbor_root_check: NeighborRootCheckStrategy,
     ) -> (u32, Option<LocalPersistenceAction<K>>) {
         debug_assert!(self.uf_state.is_root(current_root));
+        self.hot_union_attempts += 1;
         if let Some(stats) = self.diagnostics.as_mut() {
             stats.union_attempts += 1;
             stats.root_carry_attempts += 1;
@@ -721,12 +882,13 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
 
         if matches!(
             neighbor_root_check,
-            NeighborRootCheckStrategy::ParentShortcut
+            NeighborRootCheckStrategy::ParentCachedFind
         ) {
             if let Some(stats) = self.diagnostics.as_mut() {
                 stats.direct_parent_checks += 1;
             }
-            if neighbor == current_root || self.uf_state.direct_parent_is(neighbor, current_root) {
+            if neighbor == current_root {
+                self.hot_same_root_unions += 1;
                 if let Some(stats) = self.diagnostics.as_mut() {
                     stats.direct_parent_hits += 1;
                     stats.avoided_neighbor_find_calls += 1;
@@ -734,9 +896,92 @@ impl<K: LocalScalarKey> LocalBackgroundPersistenceUnionFind<K> {
                 }
                 return (current_root, None);
             }
+
+            match self.uf_state.parent_if_nonroot(neighbor) {
+                None => {
+                    // `neighbor` is already a root. The parent probe gave us the
+                    // same information as a zero-hop find, so merge it directly.
+                    if let Some(stats) = self.diagnostics.as_mut() {
+                        stats.avoided_neighbor_find_calls += 1;
+                    }
+                    return self.merge_known_roots_with_persistence(
+                        current_root,
+                        neighbor,
+                        merge_value,
+                    );
+                }
+                Some(parent) if parent == current_root => {
+                    self.hot_same_root_unions += 1;
+                    if let Some(stats) = self.diagnostics.as_mut() {
+                        stats.direct_parent_hits += 1;
+                        stats.avoided_neighbor_find_calls += 1;
+                        stats.same_root_unions += 1;
+                    }
+                    return (current_root, None);
+                }
+                Some(parent) => {
+                    let (neighbor_root, steps) =
+                        self.find_from_known_parent_with_steps(neighbor, parent);
+                    self.record_neighbor_find(steps, neighbor_root == current_root);
+                    return self.merge_known_roots_with_persistence(
+                        current_root,
+                        neighbor_root,
+                        merge_value,
+                    );
+                }
+            }
         }
 
-        let neighbor_root = self.find(neighbor);
+        if !matches!(neighbor_root_check, NeighborRootCheckStrategy::Find) {
+            if let Some(stats) = self.diagnostics.as_mut() {
+                stats.direct_parent_checks += 1;
+            }
+            if neighbor == current_root || self.uf_state.direct_parent_is(neighbor, current_root) {
+                self.hot_same_root_unions += 1;
+                if let Some(stats) = self.diagnostics.as_mut() {
+                    stats.direct_parent_hits += 1;
+                    stats.avoided_neighbor_find_calls += 1;
+                    stats.same_root_unions += 1;
+                }
+                return (current_root, None);
+            }
+
+            if matches!(neighbor_root_check, NeighborRootCheckStrategy::ParentTwoHop) {
+                if let Some(stats) = self.diagnostics.as_mut() {
+                    stats.two_hop_parent_checks += 1;
+                }
+                if self.uf_state.grandparent_is(neighbor, current_root) {
+                    self.hot_same_root_unions += 1;
+                    if let Some(stats) = self.diagnostics.as_mut() {
+                        stats.two_hop_parent_hits += 1;
+                        stats.avoided_neighbor_find_calls += 1;
+                        stats.same_root_unions += 1;
+                    }
+                    return (current_root, None);
+                }
+            }
+        }
+
+        let (neighbor_root, steps) = self.find_with_steps(neighbor);
+        self.record_neighbor_find(steps, neighbor_root == current_root);
+        self.merge_known_roots_with_persistence(current_root, neighbor_root, merge_value)
+    }
+
+    #[inline]
+    fn union_roots_from_current_root_with_persistence(
+        &mut self,
+        current_root: u32,
+        neighbor_root: u32,
+        merge_value: K,
+    ) -> (u32, Option<LocalPersistenceAction<K>>) {
+        debug_assert!(self.uf_state.is_root(current_root));
+        debug_assert!(self.uf_state.is_root(neighbor_root));
+        self.hot_union_attempts += 1;
+        if let Some(stats) = self.diagnostics.as_mut() {
+            stats.union_attempts += 1;
+            stats.root_carry_attempts += 1;
+            stats.avoided_find_calls += 1;
+        }
         self.merge_known_roots_with_persistence(current_root, neighbor_root, merge_value)
     }
 }
@@ -1132,7 +1377,11 @@ summary_event_capacity_bytes={}",
     )
 }
 
-fn emit_h2_local_action<K, F>(action: LocalPersistenceAction<K>, emit: &mut F) -> Result<()>
+fn emit_h2_local_action<K, F>(
+    action: LocalPersistenceAction<K>,
+    zero_persistence_pairs_elided: &mut u64,
+    emit: &mut F,
+) -> Result<()>
 where
     K: LocalScalarKey,
     F: FnMut(H2LocalStreamEvent<K>) -> Result<()>,
@@ -1142,6 +1391,8 @@ where
         LocalPersistenceAction::FinalPair(pair) => {
             if pair.birth < pair.death {
                 emit(H2LocalStreamEvent::FinalPair(pair))?;
+            } else {
+                *zero_persistence_pairs_elided += 1;
             }
         }
         LocalPersistenceAction::Attach(event) => emit(H2LocalStreamEvent::Attach(event))?,
@@ -1165,6 +1416,7 @@ fn union_active_neighbor_h2_sink<K, F>(
     representative_active_check: RepresentativeActiveCheckStrategy,
     union_kernel: UnionKernelStrategy,
     neighbor_root_check: NeighborRootCheckStrategy,
+    zero_persistence_pairs_elided: &mut u64,
     emit: &mut F,
 ) -> Result<()>
 where
@@ -1203,7 +1455,7 @@ where
         }
     };
     if let Some(action) = action {
-        emit_h2_local_action(action, emit)?;
+        emit_h2_local_action(action, zero_persistence_pairs_elided, emit)?;
     }
     Ok(())
 }
@@ -1230,11 +1482,15 @@ fn process_slab_h2_persistence_values_owned_sink<K, F>(
     sweep_diagnostics: bool,
     prune_elder_dominated_attaches: bool,
     prune_outside_dominated_structural: bool,
+    plateau_zero_elision: bool,
+    root_dedup: bool,
     mut emit: F,
 ) -> Result<(
     SlabH2Summary<K>,
     NeighborhoodPruningStats,
     LocalUnionFindStats,
+    u64,
+    H2RootDedupProfile,
 )>
 where
     K: LocalScalarKey,
@@ -1261,6 +1517,7 @@ where
         local_h2_birth_state,
         prune_elder_dominated_attaches,
         prune_outside_dominated_structural,
+        plateau_zero_elision,
     );
     if slab_id == 0 {
         let parent_bytes = union_find.uf_state.parent_capacity_bytes();
@@ -1293,6 +1550,9 @@ where
         .then(|| local_pruner.linear_offsets(width, height));
     let interface_node_count = u32::try_from(slab_interface_node_count(slice_size, depth))
         .expect("slab interface node count exceeds u32");
+    let mut zero_persistence_pairs_elided = 0u64;
+    let mut root_dedup_profile = H2RootDedupProfile::default();
+    let mut sweep_sample_stats = H2SweepSampleStats::default();
 
     let mut group_end = order.len();
     while group_end > 0 {
@@ -1305,6 +1565,14 @@ where
 
         for &index_u32 in &order[group_start..group_end] {
             let index = index_u32 as usize;
+            let sampled = sweep_diagnostics && {
+                let global_linear_index = (z0 as u64)
+                    .saturating_mul(slice_size as u64)
+                    .saturating_add(index as u64);
+                h2_sweep_sample(global_linear_index)
+            };
+            let activation_start = sampled.then(Instant::now);
+
             union_find.activate(index_u32);
             if let Some(active) = active.as_mut() {
                 active[index] = 1;
@@ -1331,6 +1599,10 @@ where
                 }
             }
 
+            if let Some(start) = activation_start {
+                sweep_sample_stats.activation_boundary_nanos += start.elapsed().as_nanos();
+            }
+
             let mut current_root = index_u32;
             let use_interior_fast_path =
                 matches!(neighbor_kernel, NeighborKernelStrategy::InteriorFast)
@@ -1340,6 +1612,16 @@ where
                     && y + 1 < height
                     && z > 0
                     && z + 1 < depth;
+
+            if sampled {
+                sweep_sample_stats.sampled_voxels += 1;
+                if use_interior_fast_path {
+                    sweep_sample_stats.sampled_interior_voxels += 1;
+                } else {
+                    sweep_sample_stats.sampled_boundary_voxels += 1;
+                }
+            }
+            let neighborhood_start = sampled.then(Instant::now);
 
             let representatives = if use_interior_fast_path {
                 let offsets = linear_offsets
@@ -1384,26 +1666,123 @@ where
                 }
             };
 
-            for neighbor in representatives.iter() {
-                union_active_neighbor_h2_sink(
-                    &mut union_find,
-                    active.as_deref(),
-                    active_state,
-                    index_u32,
-                    &mut current_root,
-                    neighbor,
-                    value,
-                    representative_active_check,
-                    union_kernel,
-                    neighbor_root_check,
-                    &mut emit,
-                )?;
+            if let Some(start) = neighborhood_start {
+                sweep_sample_stats.neighborhood_pruning_nanos += start.elapsed().as_nanos();
+                sweep_sample_stats.sampled_representatives +=
+                    u64::try_from(representatives.iter().count())
+                        .expect("sampled representative count exceeds u64");
+            }
+            let union_start = sampled.then(Instant::now);
+
+            if root_dedup {
+                // Exact pruning: all roots are resolved before the new voxel is
+                // connected to any neighbor. Multiple representatives with the
+                // same root therefore denote one pre-existing component; only
+                // the first occurrence can change persistence state.
+                let mut distinct_roots = [0u32; 26];
+                let mut distinct_len = 0usize;
+                for neighbor in representatives.iter() {
+                    if matches!(
+                        representative_active_check,
+                        RepresentativeActiveCheckStrategy::Recheck
+                    ) {
+                        let failed = match active_state {
+                            ActiveStateStrategy::Separate => {
+                                active
+                                    .as_deref()
+                                    .expect("separate active state requires byte array")[neighbor]
+                                    == 0
+                            }
+                            ActiveStateStrategy::ParentSentinel => {
+                                !union_find.parent_state_is_active(neighbor)
+                            }
+                        };
+                        union_find.record_active_recheck(failed);
+                        if failed {
+                            continue;
+                        }
+                    }
+
+                    root_dedup_profile.inputs += 1;
+                    let root = union_find.find(neighbor as u32);
+                    if distinct_roots[..distinct_len].contains(&root) {
+                        root_dedup_profile.skipped_duplicate_roots += 1;
+                        continue;
+                    }
+                    debug_assert!(distinct_len < distinct_roots.len());
+                    distinct_roots[distinct_len] = root;
+                    distinct_len += 1;
+                    root_dedup_profile.unique_roots += 1;
+                }
+
+                for neighbor_root in distinct_roots[..distinct_len].iter().copied() {
+                    let (new_root, action) = union_find
+                        .union_roots_from_current_root_with_persistence(
+                            current_root,
+                            neighbor_root,
+                            value,
+                        );
+                    current_root = new_root;
+                    if let Some(action) = action {
+                        emit_h2_local_action(
+                            action,
+                            &mut zero_persistence_pairs_elided,
+                            &mut emit,
+                        )?;
+                    }
+                }
+            } else {
+                for neighbor in representatives.iter() {
+                    union_active_neighbor_h2_sink(
+                        &mut union_find,
+                        active.as_deref(),
+                        active_state,
+                        index_u32,
+                        &mut current_root,
+                        neighbor,
+                        value,
+                        representative_active_check,
+                        union_kernel,
+                        neighbor_root_check,
+                        &mut zero_persistence_pairs_elided,
+                        &mut emit,
+                    )?;
+                }
+            }
+
+            if let Some(start) = union_start {
+                sweep_sample_stats.union_persistence_emit_nanos += start.elapsed().as_nanos();
             }
         }
         group_end = group_start;
     }
 
+    if sweep_diagnostics {
+        let sampled_total_nanos = sweep_sample_stats
+            .activation_boundary_nanos
+            .saturating_add(sweep_sample_stats.neighborhood_pruning_nanos)
+            .saturating_add(sweep_sample_stats.union_persistence_emit_nanos);
+        println!(
+            "PROFILE_H2_SWEEP_SAMPLE slab={} sample_stride={} sampled_voxels={} sampled_interior_voxels={} sampled_boundary_voxels={} sampled_representatives={} activation_boundary_ns={} neighborhood_pruning_ns={} union_persistence_emit_ns={} sampled_total_ns={}",
+            slab_id,
+            H2_SWEEP_SAMPLE_STRIDE,
+            sweep_sample_stats.sampled_voxels,
+            sweep_sample_stats.sampled_interior_voxels,
+            sweep_sample_stats.sampled_boundary_voxels,
+            sweep_sample_stats.sampled_representatives,
+            sweep_sample_stats.activation_boundary_nanos,
+            sweep_sample_stats.neighborhood_pruning_nanos,
+            sweep_sample_stats.union_persistence_emit_nanos,
+            sampled_total_nanos,
+        );
+    }
+
+    zero_persistence_pairs_elided += union_find.plateau_zero_pairs_early_elided();
     let pruning_stats = local_pruner.diagnostic_stats();
+    let (hot_attempts, hot_successful, hot_same_root) = union_find.hot_union_stats();
+    root_dedup_profile.union_attempts = hot_attempts;
+    root_dedup_profile.successful_unions = hot_successful;
+    root_dedup_profile.same_root_unions = hot_same_root;
     let union_find_stats = union_find.diagnostic_stats();
     Ok((
         SlabH2Summary {
@@ -1418,6 +1797,272 @@ where
         },
         pruning_stats,
         union_find_stats,
+        zero_persistence_pairs_elided,
+        root_dedup_profile,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_slab_h2_persistence_scalar_direct_profiled<F>(
+    slab_id: usize,
+    z0: usize,
+    block: ScalarBlock,
+    global_width: usize,
+    global_height: usize,
+    global_depth: usize,
+    background_connectivity: Connectivity,
+    neighbor_kernel: NeighborKernelStrategy,
+    representative_active_check: RepresentativeActiveCheckStrategy,
+    union_kernel: UnionKernelStrategy,
+    neighbor_root_check: NeighborRootCheckStrategy,
+    active_state: ActiveStateStrategy,
+    interface_state: InterfaceStateStrategy,
+    uf_layout: UnionFindLayoutStrategy,
+    local_h2_birth_state: LocalH2BirthStateStrategy,
+    sweep_diagnostics: bool,
+    prune_elder_dominated_attaches: bool,
+    prune_outside_dominated_structural: bool,
+    emit: F,
+) -> Result<(SlabH2Summary<ScalarKey>, H2SlabPreparationProfile)>
+where
+    F: FnMut(H2LocalStreamEvent<ScalarKey>) -> Result<()>,
+{
+    if !matches!(local_h2_birth_state, LocalH2BirthStateStrategy::Compact) {
+        bail!("H2 reuse-input/direct leaf processing requires compact local H2 birth storage");
+    }
+    let shape = block.shape;
+    let voxel_count = block.values.len();
+    let order_start = Instant::now();
+    let order = sorted_scalar_indices(&block.values, block.pixel_type);
+    let scalar_order_seconds = order_start.elapsed().as_secs_f64();
+    let sweep_start = Instant::now();
+    let (
+        summary,
+        pruning_stats,
+        union_find_stats,
+        zero_persistence_pairs_elided,
+        _root_dedup_profile,
+    ) = process_slab_h2_persistence_values_owned_sink(
+        slab_id,
+        z0,
+        shape,
+        block.values,
+        order,
+        global_width,
+        global_height,
+        global_depth,
+        background_connectivity,
+        neighbor_kernel,
+        representative_active_check,
+        union_kernel,
+        neighbor_root_check,
+        active_state,
+        interface_state,
+        uf_layout,
+        local_h2_birth_state,
+        sweep_diagnostics,
+        prune_elder_dominated_attaches,
+        prune_outside_dominated_structural,
+        false,
+        false,
+        emit,
+    )?;
+    let local_sweep_seconds = sweep_start.elapsed().as_secs_f64();
+    Ok((
+        summary,
+        H2SlabPreparationProfile {
+            scalar_order_seconds,
+            local_sweep_seconds,
+            total_voxels: u64::try_from(voxel_count).expect("slab voxel count exceeds u64"),
+            interior_fast_voxels: if matches!(neighbor_kernel, NeighborKernelStrategy::InteriorFast)
+            {
+                u64::try_from(shape[0].saturating_sub(2)).expect("width exceeds u64")
+                    * u64::try_from(shape[1].saturating_sub(2)).expect("height exceeds u64")
+                    * u64::try_from(shape[2].saturating_sub(2)).expect("depth exceeds u64")
+            } else {
+                0
+            },
+            pruning_mask_calls: pruning_stats.mask_calls,
+            active_state_checks: pruning_stats.active_state_checks,
+            active_neighbor_hits: pruning_stats.active_neighbor_hits,
+            representative_visits: pruning_stats.representative_visits,
+            pruning_cache_hits: pruning_stats.cache_hits,
+            pruning_cache_misses: pruning_stats.cache_misses,
+            component_mask_computations: pruning_stats.component_mask_computations,
+            union_attempts: union_find_stats.union_attempts,
+            successful_unions: union_find_stats.successful_unions,
+            same_root_unions: union_find_stats.same_root_unions,
+            find_calls: union_find_stats.find_calls,
+            find_parent_steps: union_find_stats.find_parent_steps,
+            active_rechecks: union_find_stats.active_rechecks,
+            active_recheck_failures: union_find_stats.active_recheck_failures,
+            root_carry_attempts: union_find_stats.root_carry_attempts,
+            avoided_find_calls: union_find_stats.avoided_find_calls,
+            direct_parent_checks: union_find_stats.direct_parent_checks,
+            direct_parent_hits: union_find_stats.direct_parent_hits,
+            two_hop_parent_checks: union_find_stats.two_hop_parent_checks,
+            two_hop_parent_hits: union_find_stats.two_hop_parent_hits,
+            avoided_neighbor_find_calls: union_find_stats.avoided_neighbor_find_calls,
+            neighbor_find_calls: union_find_stats.neighbor_find_calls,
+            neighbor_find_parent_steps: union_find_stats.neighbor_find_parent_steps,
+            neighbor_find_zero_hop: union_find_stats.neighbor_find_zero_hop,
+            neighbor_find_one_hop: union_find_stats.neighbor_find_one_hop,
+            neighbor_find_two_hop: union_find_stats.neighbor_find_two_hop,
+            neighbor_find_gt_two_hop: union_find_stats.neighbor_find_gt_two_hop,
+            same_root_neighbor_find_zero_hop: union_find_stats.same_root_neighbor_find_zero_hop,
+            same_root_neighbor_find_one_hop: union_find_stats.same_root_neighbor_find_one_hop,
+            same_root_neighbor_find_two_hop: union_find_stats.same_root_neighbor_find_two_hop,
+            same_root_neighbor_find_gt_two_hop: union_find_stats.same_root_neighbor_find_gt_two_hop,
+            interface_rep_queries: union_find_stats.interface_rep_queries,
+            interface_rep_writes: union_find_stats.interface_rep_writes,
+            interface_forced_root_unions: union_find_stats.interface_forced_root_unions,
+            interface_interface_unions: union_find_stats.interface_interface_unions,
+            interface_state_bytes: if matches!(interface_state, InterfaceStateStrategy::Vector) {
+                u64::try_from(voxel_count).expect("slab voxel count exceeds u64") * 4
+            } else {
+                0
+            },
+            max_rank_observed: union_find_stats.max_rank_observed,
+            uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
+            uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided,
+        },
+    ))
+}
+
+/// Direct-event H2 leaf processor for compact exact U16 keys.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_slab_h2_persistence_u16_native_direct_profiled<F>(
+    slab_id: usize,
+    z0: usize,
+    block: U16ScalarBlock,
+    global_width: usize,
+    global_height: usize,
+    global_depth: usize,
+    background_connectivity: Connectivity,
+    neighbor_kernel: NeighborKernelStrategy,
+    representative_active_check: RepresentativeActiveCheckStrategy,
+    union_kernel: UnionKernelStrategy,
+    neighbor_root_check: NeighborRootCheckStrategy,
+    active_state: ActiveStateStrategy,
+    interface_state: InterfaceStateStrategy,
+    uf_layout: UnionFindLayoutStrategy,
+    local_h2_birth_state: LocalH2BirthStateStrategy,
+    sweep_diagnostics: bool,
+    prune_elder_dominated_attaches: bool,
+    prune_outside_dominated_structural: bool,
+    plateau_zero_elision: bool,
+    root_dedup: bool,
+    emit: F,
+) -> Result<(
+    SlabH2Summary<U16Key>,
+    H2SlabPreparationProfile,
+    H2RootDedupProfile,
+)>
+where
+    F: FnMut(H2LocalStreamEvent<U16Key>) -> Result<()>,
+{
+    if !matches!(local_h2_birth_state, LocalH2BirthStateStrategy::Compact) {
+        bail!("H2 reuse-input/direct leaf processing requires compact local H2 birth storage");
+    }
+    let shape = block.shape;
+    let voxel_count = block.values.len();
+    let order_start = Instant::now();
+    let order = sorted_u16_indices(&block.values);
+    let scalar_order_seconds = order_start.elapsed().as_secs_f64();
+    let sweep_start = Instant::now();
+    let (
+        summary,
+        pruning_stats,
+        union_find_stats,
+        zero_persistence_pairs_elided,
+        root_dedup_profile,
+    ) = process_slab_h2_persistence_values_owned_sink(
+        slab_id,
+        z0,
+        shape,
+        block.values,
+        order,
+        global_width,
+        global_height,
+        global_depth,
+        background_connectivity,
+        neighbor_kernel,
+        representative_active_check,
+        union_kernel,
+        neighbor_root_check,
+        active_state,
+        interface_state,
+        uf_layout,
+        local_h2_birth_state,
+        sweep_diagnostics,
+        prune_elder_dominated_attaches,
+        prune_outside_dominated_structural,
+        plateau_zero_elision,
+        root_dedup,
+        emit,
+    )?;
+    let local_sweep_seconds = sweep_start.elapsed().as_secs_f64();
+    Ok((
+        summary,
+        H2SlabPreparationProfile {
+            scalar_order_seconds,
+            local_sweep_seconds,
+            total_voxels: u64::try_from(voxel_count).expect("slab voxel count exceeds u64"),
+            interior_fast_voxels: if matches!(neighbor_kernel, NeighborKernelStrategy::InteriorFast)
+            {
+                u64::try_from(shape[0].saturating_sub(2)).expect("width exceeds u64")
+                    * u64::try_from(shape[1].saturating_sub(2)).expect("height exceeds u64")
+                    * u64::try_from(shape[2].saturating_sub(2)).expect("depth exceeds u64")
+            } else {
+                0
+            },
+            pruning_mask_calls: pruning_stats.mask_calls,
+            active_state_checks: pruning_stats.active_state_checks,
+            active_neighbor_hits: pruning_stats.active_neighbor_hits,
+            representative_visits: pruning_stats.representative_visits,
+            pruning_cache_hits: pruning_stats.cache_hits,
+            pruning_cache_misses: pruning_stats.cache_misses,
+            component_mask_computations: pruning_stats.component_mask_computations,
+            union_attempts: union_find_stats.union_attempts,
+            successful_unions: union_find_stats.successful_unions,
+            same_root_unions: union_find_stats.same_root_unions,
+            find_calls: union_find_stats.find_calls,
+            find_parent_steps: union_find_stats.find_parent_steps,
+            active_rechecks: union_find_stats.active_rechecks,
+            active_recheck_failures: union_find_stats.active_recheck_failures,
+            root_carry_attempts: union_find_stats.root_carry_attempts,
+            avoided_find_calls: union_find_stats.avoided_find_calls,
+            direct_parent_checks: union_find_stats.direct_parent_checks,
+            direct_parent_hits: union_find_stats.direct_parent_hits,
+            two_hop_parent_checks: union_find_stats.two_hop_parent_checks,
+            two_hop_parent_hits: union_find_stats.two_hop_parent_hits,
+            avoided_neighbor_find_calls: union_find_stats.avoided_neighbor_find_calls,
+            neighbor_find_calls: union_find_stats.neighbor_find_calls,
+            neighbor_find_parent_steps: union_find_stats.neighbor_find_parent_steps,
+            neighbor_find_zero_hop: union_find_stats.neighbor_find_zero_hop,
+            neighbor_find_one_hop: union_find_stats.neighbor_find_one_hop,
+            neighbor_find_two_hop: union_find_stats.neighbor_find_two_hop,
+            neighbor_find_gt_two_hop: union_find_stats.neighbor_find_gt_two_hop,
+            same_root_neighbor_find_zero_hop: union_find_stats.same_root_neighbor_find_zero_hop,
+            same_root_neighbor_find_one_hop: union_find_stats.same_root_neighbor_find_one_hop,
+            same_root_neighbor_find_two_hop: union_find_stats.same_root_neighbor_find_two_hop,
+            same_root_neighbor_find_gt_two_hop: union_find_stats.same_root_neighbor_find_gt_two_hop,
+            interface_rep_queries: union_find_stats.interface_rep_queries,
+            interface_rep_writes: union_find_stats.interface_rep_writes,
+            interface_forced_root_unions: union_find_stats.interface_forced_root_unions,
+            interface_interface_unions: union_find_stats.interface_interface_unions,
+            interface_state_bytes: if matches!(interface_state, InterfaceStateStrategy::Vector) {
+                u64::try_from(voxel_count).expect("slab voxel count exceeds u64") * 4
+            } else {
+                0
+            },
+            max_rank_observed: union_find_stats.max_rank_observed,
+            uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
+            uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided,
+        },
+        root_dedup_profile,
     ))
 }
 
@@ -1455,7 +2100,13 @@ where
     let order = sorted_f32_indices(&block.values);
     let scalar_order_seconds = order_start.elapsed().as_secs_f64();
     let sweep_start = Instant::now();
-    let (summary, pruning_stats, union_find_stats) = process_slab_h2_persistence_values_owned_sink(
+    let (
+        summary,
+        pruning_stats,
+        union_find_stats,
+        zero_persistence_pairs_elided,
+        _root_dedup_profile,
+    ) = process_slab_h2_persistence_values_owned_sink(
         slab_id,
         z0,
         shape,
@@ -1476,6 +2127,8 @@ where
         sweep_diagnostics,
         prune_elder_dominated_attaches,
         prune_outside_dominated_structural,
+        false,
+        false,
         emit,
     )?;
     let local_sweep_seconds = sweep_start.elapsed().as_secs_f64();
@@ -1511,7 +2164,19 @@ where
             avoided_find_calls: union_find_stats.avoided_find_calls,
             direct_parent_checks: union_find_stats.direct_parent_checks,
             direct_parent_hits: union_find_stats.direct_parent_hits,
+            two_hop_parent_checks: union_find_stats.two_hop_parent_checks,
+            two_hop_parent_hits: union_find_stats.two_hop_parent_hits,
             avoided_neighbor_find_calls: union_find_stats.avoided_neighbor_find_calls,
+            neighbor_find_calls: union_find_stats.neighbor_find_calls,
+            neighbor_find_parent_steps: union_find_stats.neighbor_find_parent_steps,
+            neighbor_find_zero_hop: union_find_stats.neighbor_find_zero_hop,
+            neighbor_find_one_hop: union_find_stats.neighbor_find_one_hop,
+            neighbor_find_two_hop: union_find_stats.neighbor_find_two_hop,
+            neighbor_find_gt_two_hop: union_find_stats.neighbor_find_gt_two_hop,
+            same_root_neighbor_find_zero_hop: union_find_stats.same_root_neighbor_find_zero_hop,
+            same_root_neighbor_find_one_hop: union_find_stats.same_root_neighbor_find_one_hop,
+            same_root_neighbor_find_two_hop: union_find_stats.same_root_neighbor_find_two_hop,
+            same_root_neighbor_find_gt_two_hop: union_find_stats.same_root_neighbor_find_gt_two_hop,
             interface_rep_queries: union_find_stats.interface_rep_queries,
             interface_rep_writes: union_find_stats.interface_rep_writes,
             interface_forced_root_unions: union_find_stats.interface_forced_root_unions,
@@ -1524,6 +2189,7 @@ where
             max_rank_observed: union_find_stats.max_rank_observed,
             uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
             uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided,
         },
     ))
 }
@@ -1684,7 +2350,19 @@ pub(crate) fn process_slab_h2_persistence_profiled_with_memory_audit(
             avoided_find_calls: union_find_stats.avoided_find_calls,
             direct_parent_checks: union_find_stats.direct_parent_checks,
             direct_parent_hits: union_find_stats.direct_parent_hits,
+            two_hop_parent_checks: union_find_stats.two_hop_parent_checks,
+            two_hop_parent_hits: union_find_stats.two_hop_parent_hits,
             avoided_neighbor_find_calls: union_find_stats.avoided_neighbor_find_calls,
+            neighbor_find_calls: union_find_stats.neighbor_find_calls,
+            neighbor_find_parent_steps: union_find_stats.neighbor_find_parent_steps,
+            neighbor_find_zero_hop: union_find_stats.neighbor_find_zero_hop,
+            neighbor_find_one_hop: union_find_stats.neighbor_find_one_hop,
+            neighbor_find_two_hop: union_find_stats.neighbor_find_two_hop,
+            neighbor_find_gt_two_hop: union_find_stats.neighbor_find_gt_two_hop,
+            same_root_neighbor_find_zero_hop: union_find_stats.same_root_neighbor_find_zero_hop,
+            same_root_neighbor_find_one_hop: union_find_stats.same_root_neighbor_find_one_hop,
+            same_root_neighbor_find_two_hop: union_find_stats.same_root_neighbor_find_two_hop,
+            same_root_neighbor_find_gt_two_hop: union_find_stats.same_root_neighbor_find_gt_two_hop,
             interface_rep_queries: union_find_stats.interface_rep_queries,
             interface_rep_writes: union_find_stats.interface_rep_writes,
             interface_forced_root_unions: union_find_stats.interface_forced_root_unions,
@@ -1697,6 +2375,7 @@ pub(crate) fn process_slab_h2_persistence_profiled_with_memory_audit(
             max_rank_observed: union_find_stats.max_rank_observed,
             uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
             uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided: 0,
         },
     )
 }
@@ -1859,7 +2538,19 @@ pub(crate) fn process_slab_h2_persistence_f32_native_profiled_with_memory_audit(
             avoided_find_calls: union_find_stats.avoided_find_calls,
             direct_parent_checks: union_find_stats.direct_parent_checks,
             direct_parent_hits: union_find_stats.direct_parent_hits,
+            two_hop_parent_checks: union_find_stats.two_hop_parent_checks,
+            two_hop_parent_hits: union_find_stats.two_hop_parent_hits,
             avoided_neighbor_find_calls: union_find_stats.avoided_neighbor_find_calls,
+            neighbor_find_calls: union_find_stats.neighbor_find_calls,
+            neighbor_find_parent_steps: union_find_stats.neighbor_find_parent_steps,
+            neighbor_find_zero_hop: union_find_stats.neighbor_find_zero_hop,
+            neighbor_find_one_hop: union_find_stats.neighbor_find_one_hop,
+            neighbor_find_two_hop: union_find_stats.neighbor_find_two_hop,
+            neighbor_find_gt_two_hop: union_find_stats.neighbor_find_gt_two_hop,
+            same_root_neighbor_find_zero_hop: union_find_stats.same_root_neighbor_find_zero_hop,
+            same_root_neighbor_find_one_hop: union_find_stats.same_root_neighbor_find_one_hop,
+            same_root_neighbor_find_two_hop: union_find_stats.same_root_neighbor_find_two_hop,
+            same_root_neighbor_find_gt_two_hop: union_find_stats.same_root_neighbor_find_gt_two_hop,
             interface_rep_queries: union_find_stats.interface_rep_queries,
             interface_rep_writes: union_find_stats.interface_rep_writes,
             interface_forced_root_unions: union_find_stats.interface_forced_root_unions,
@@ -1872,6 +2563,7 @@ pub(crate) fn process_slab_h2_persistence_f32_native_profiled_with_memory_audit(
             max_rank_observed: union_find_stats.max_rank_observed,
             uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
             uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided: 0,
         },
     )
 }
@@ -2750,6 +3442,28 @@ pub fn compute_h2_scalar_batch(
 mod tests {
     use super::*;
 
+    #[test]
+    fn fast_interface_query_is_on_by_default_and_can_be_disabled() {
+        assert!(h2_fast_interface_query_enabled_from_value(None));
+        assert!(h2_fast_interface_query_enabled_from_value(Some("1")));
+        assert!(h2_fast_interface_query_enabled_from_value(Some("true")));
+        assert!(h2_fast_interface_query_enabled_from_value(Some("on")));
+
+        for value in ["0", "false", "FALSE", "off", "OFF", "no", "NO"] {
+            assert!(!h2_fast_interface_query_enabled_from_value(Some(value)));
+        }
+    }
+
+    #[test]
+    fn h2_sweep_sampler_is_deterministic_and_has_expected_density() {
+        let selected = (0u64..(1u64 << 20))
+            .filter(|&index| h2_sweep_sample(index))
+            .count();
+        assert_eq!(selected, 1021);
+        assert!(h2_sweep_sample(6));
+        assert!(!h2_sweep_sample(0));
+    }
+
     fn widen_f32_summary(summary: SlabH2Summary<F32Key>) -> SlabH2Summary {
         SlabH2Summary {
             slab_id: summary.slab_id,
@@ -2979,12 +3693,54 @@ mod tests {
                 LocalH2BirthStateStrategy::Tagged,
                 true,
             );
+            let (two_hop_summary, two_hop_profile) = process_slab_h2_persistence_profiled(
+                0,
+                &block,
+                5,
+                5,
+                5,
+                connectivity,
+                NeighborKernelStrategy::InteriorFast,
+                RepresentativeActiveCheckStrategy::Recheck,
+                UnionKernelStrategy::RootCarrying,
+                NeighborRootCheckStrategy::ParentTwoHop,
+                ActiveStateStrategy::Separate,
+                InterfaceStateStrategy::Vector,
+                UnionFindLayoutStrategy::ParentRank,
+                LocalH2BirthStateStrategy::Tagged,
+                true,
+            );
+            let (cached_find_summary, cached_find_profile) = process_slab_h2_persistence_profiled(
+                0,
+                &block,
+                5,
+                5,
+                5,
+                connectivity,
+                NeighborKernelStrategy::InteriorFast,
+                RepresentativeActiveCheckStrategy::Recheck,
+                UnionKernelStrategy::RootCarrying,
+                NeighborRootCheckStrategy::ParentCachedFind,
+                ActiveStateStrategy::Separate,
+                InterfaceStateStrategy::Vector,
+                UnionFindLayoutStrategy::ParentRank,
+                LocalH2BirthStateStrategy::Tagged,
+                true,
+            );
             let find_intervals = reduce_h2_persistence(&[find_summary], connectivity).unwrap();
             let shortcut_intervals =
                 reduce_h2_persistence(&[shortcut_summary], connectivity).unwrap();
+            let two_hop_intervals =
+                reduce_h2_persistence(&[two_hop_summary], connectivity).unwrap();
+            let cached_find_intervals =
+                reduce_h2_persistence(&[cached_find_summary], connectivity).unwrap();
             assert_eq!(shortcut_intervals, find_intervals);
+            assert_eq!(two_hop_intervals, find_intervals);
+            assert_eq!(cached_find_intervals, find_intervals);
             assert_eq!(find_profile.direct_parent_checks, 0);
             assert_eq!(find_profile.direct_parent_hits, 0);
+            assert_eq!(find_profile.two_hop_parent_checks, 0);
+            assert_eq!(find_profile.two_hop_parent_hits, 0);
             assert_eq!(find_profile.avoided_neighbor_find_calls, 0);
             assert_eq!(
                 shortcut_profile.direct_parent_checks,
@@ -2994,7 +3750,33 @@ mod tests {
                 shortcut_profile.direct_parent_hits,
                 shortcut_profile.avoided_neighbor_find_calls
             );
+            assert_eq!(shortcut_profile.two_hop_parent_checks, 0);
+            assert_eq!(shortcut_profile.two_hop_parent_hits, 0);
+            assert_eq!(
+                two_hop_profile.direct_parent_checks,
+                two_hop_profile.root_carry_attempts
+            );
+            assert_eq!(
+                two_hop_profile.direct_parent_hits + two_hop_profile.two_hop_parent_checks,
+                two_hop_profile.root_carry_attempts
+            );
+            assert_eq!(
+                two_hop_profile.direct_parent_hits + two_hop_profile.two_hop_parent_hits,
+                two_hop_profile.avoided_neighbor_find_calls
+            );
             assert!(shortcut_profile.find_calls <= find_profile.find_calls);
+            assert!(two_hop_profile.find_calls <= shortcut_profile.find_calls);
+            assert!(two_hop_profile.neighbor_find_calls <= shortcut_profile.neighbor_find_calls);
+            assert_eq!(
+                cached_find_profile.direct_parent_checks,
+                cached_find_profile.root_carry_attempts
+            );
+            assert_eq!(cached_find_profile.two_hop_parent_checks, 0);
+            assert_eq!(cached_find_profile.two_hop_parent_hits, 0);
+            assert!(cached_find_profile.find_calls <= shortcut_profile.find_calls);
+            assert!(
+                cached_find_profile.neighbor_find_calls <= shortcut_profile.neighbor_find_calls
+            );
         }
     }
 

@@ -1,0 +1,6 @@
+block_id,pairs,median_pct_delta_wall_seconds,median_pct_delta_local_sweep_seconds,candidate_faster_wall_pairs,non_tied_wall_pairs,two_sided_sign_test_p_wall,median_pct_delta_cycles,median_pct_delta_instructions,median_pct_delta_branches,median_pct_delta_branch_misses,perf_available
+1,7,-1.6847510377089083,-2.0195972487916065,6,7,0.125,0.0,0.0,0.0,0.0,0
+2,7,0.8881474176326395,0.7404335104489284,3,7,1.0,0.0,0.0,0.0,0.0,0
+3,7,-1.1264775280317014,-1.5139242364917647,6,7,0.125,0.0,0.0,0.0,0.0,0
+4,7,-2.0096860619270664,-2.355326418298248,7,7,0.015625,0.0,0.0,0.0,0.0,0
+5,7,-1.272831187383487,-1.8571213817656773,7,7,0.015625,0.0,0.0,0.0,0.0,0
