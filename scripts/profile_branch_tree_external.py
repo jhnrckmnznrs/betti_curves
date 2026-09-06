@@ -147,6 +147,13 @@ def run_one(args: argparse.Namespace, dim: str, depth: int, repeat: int) -> dict
             "parent_interface",
             "cross_retained",
             "cross_candidates",
+            "input_attach",
+            "input_interface",
+            "streamed_events",
+            "materialized_events",
+            "history_input_events",
+            "history_retained_events",
+            "history_contracted_zero_events",
         )
         for field in integer_combine_fields:
             vals = []
@@ -248,6 +255,19 @@ def main() -> int:
                 "median_minor_faults": med(group, "minor_faults"),
                 "median_major_faults": med(group, "major_faults"),
                 "median_max_pair_nodes": med(group, "max_pair_nodes"),
+                "median_leaf_one_boundary_internal": med(group, "leaf_one_boundary_internal"),
+                "median_leaf_finalized_attach_early": med(group, "leaf_finalized_attach_early"),
+                "median_leaf_propagated_attach": med(group, "leaf_propagated_attach"),
+                "median_leaf_local_history_input_events": med(group, "leaf_local_history_input_events"),
+                "median_leaf_local_history_retained_events": med(group, "leaf_local_history_retained_events"),
+                "median_leaf_local_history_contracted_zero_events": med(group, "leaf_local_history_contracted_zero_events"),
+                "median_leaf_local_history_repaired_parent_refs": med(group, "leaf_local_history_repaired_parent_refs"),
+                "median_recursive_history_nodes": med(group, "recursive_history_nodes"),
+                "median_recursive_history_input_events": med(group, "recursive_history_input_events"),
+                "median_recursive_history_retained_events": med(group, "recursive_history_retained_events"),
+                "median_recursive_history_contracted_zero_events": med(group, "recursive_history_contracted_zero_events"),
+                "median_recursive_history_repaired_parent_refs": med(group, "recursive_history_repaired_parent_refs"),
+                "median_central_history_input_events": med(group, "central_history_input_events"),
                 "median_finalized_input_events": med(group, "finalized_input_events"),
                 "median_finalized_events": med(group, "finalized_events"),
                 "median_contracted_zero_events": med(group, "contracted_zero_events"),
@@ -272,6 +292,13 @@ def main() -> int:
                 "median_combine_total_seconds": med(group, "combine_total_total_seconds"),
                 "median_combine_total_cross_candidates": med(group, "combine_total_cross_candidates"),
                 "median_combine_total_cross_retained": med(group, "combine_total_cross_retained"),
+                "median_combine_total_input_attach": med(group, "combine_total_input_attach"),
+                "median_combine_total_input_interface": med(group, "combine_total_input_interface"),
+                "median_combine_total_streamed_events": med(group, "combine_total_streamed_events"),
+                "median_combine_total_materialized_events": med(group, "combine_total_materialized_events"),
+                "median_combine_total_history_input_events": med(group, "combine_total_history_input_events"),
+                "median_combine_total_history_retained_events": med(group, "combine_total_history_retained_events"),
+                "median_combine_total_history_contracted_zero_events": med(group, "combine_total_history_contracted_zero_events"),
                 "median_cross_retention_fraction": med(group, "cross_retention_fraction"),
             })
 
@@ -286,6 +313,10 @@ def main() -> int:
             f"{r['median_max_rss_mb']:.1f} MiB RSS, "
             f"events={r['median_finalized_events']:.0f}/"
             f"{r['median_finalized_input_events']:.0f}, "
+            f"leaf_history={r['median_leaf_local_history_retained_events']:.0f}/"
+            f"{r['median_leaf_local_history_input_events']:.0f}, "
+            f"recursive_zero={r['median_recursive_history_contracted_zero_events']:.0f}, "
+            f"central_input={r['median_central_history_input_events']:.0f}, "
             f"zero_contract={r['median_contracted_zero_events']:.0f}, "
             f"stored={r['median_finalized_storage_mb']:.1f} MiB, "
             f"leaf={r['median_leaf_batch_seconds']:.3f}s, "

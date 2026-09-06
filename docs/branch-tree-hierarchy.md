@@ -87,6 +87,10 @@ in ascending sublevel order; H2 performs the dual operation in descending superl
 relations are intentionally left to plateau canonicalization. This keeps ancestry exact without retaining
 all eliminated interface branches.
 
+## Streaming ordered fan-in
+
+Adjacent summaries are reconciled without first constructing one merged event vector. A cursor merges the already filtration-ordered attach, interface, and cross-interface streams and feeds each selected event immediately to the pair union-find. The cursor uses the same tie order as the previous stable-sort/linear-merge path, so this changes storage and memory traffic rather than branch-tree semantics. Set `BETTI_HIER_MATERIALIZE_FANIN=1` to materialize the cursor output for reference A/B runs.
+
 ## Finalized-history contraction
 
 The optimized hierarchical branch-tree path can contract finalized history

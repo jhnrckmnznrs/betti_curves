@@ -239,7 +239,7 @@ See [`docs/performance-profiling.md`](docs/performance-profiling.md) for interpr
 
 ## Hierarchical branch trees
 
-The branch-tree hierarchy extends the slab-summary architecture to elder-rule ancestry while removing equal-threshold event-order ambiguity through plateau-canonical parenting. Pairwise reconciliation remains bounded by a small multiple of one image face; the current final node table is still materialized in memory. See [`docs/branch-tree-hierarchy.md`](docs/branch-tree-hierarchy.md).
+The branch-tree hierarchy extends the slab-summary architecture to elder-rule ancestry while removing equal-threshold event-order ambiguity through plateau-canonical parenting. Pairwise reconciliation remains bounded by a small multiple of one image face; the current final node table is still materialized in memory. See [`docs/branch-tree-hierarchy.md`](docs/branch-tree-hierarchy.md). The hierarchical leaf path also distinguishes genuinely boundary-state-changing attaches from internal branch deaths that can be finalized immediately; see [`docs/hierarchical-leaf-attach-pruning.md`](docs/hierarchical-leaf-attach-pruning.md). Finalized zero-persistence history is contracted online, including an experimental leaf-local staging path that prevents diagonal leaf deaths from entering central history; see [`docs/hierarchical-history-contraction.md`](docs/hierarchical-history-contraction.md).
 
 ## Repository layout
 
@@ -278,3 +278,7 @@ The implementation shares common algorithmic ingredients with other cubical-pers
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+### Experimental recursive branch-history contraction
+
+The hierarchical branch-tree implementation can contract zero-persistence finalized history at every fan-in node before the summary is propagated upward. This extends leaf-local history contraction and is intended to keep root history close to the final branch-tree scale. Set `BETTI_HIER_RECURSIVE_HISTORY=0` to restore the v11 internal-history behavior for A/B validation. See `docs/hierarchical-recursive-history-contraction.md`.

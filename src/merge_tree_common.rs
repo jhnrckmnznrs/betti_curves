@@ -115,6 +115,7 @@ impl CompactH0BranchMerge {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn expand(self, value: u16) -> H0BranchMerge {
         H0BranchMerge {
             value,
@@ -156,6 +157,7 @@ impl CompactH2BranchMerge {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn parent(self) -> H2Branch {
         if self.parent_id == OUTSIDE_BRANCH_ID {
             H2Branch::Outside
@@ -167,6 +169,7 @@ impl CompactH2BranchMerge {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn expand(self, value: u16) -> H2BranchMerge {
         H2BranchMerge {
             value,
@@ -524,6 +527,7 @@ impl H0TreeRecorder {
     /// into the general-purpose merge representation. Zero-persistence events
     /// stay compact all the way through plateau contraction; only exported
     /// positive-persistence branches are materialized as `H0BranchMerge`.
+    #[cfg(test)]
     pub(crate) fn record_compact_merge(
         &mut self,
         value: u16,
@@ -871,6 +875,7 @@ impl H2TreeRecorder {
     /// Record one compact hierarchical H2 event without expanding every
     /// zero-persistence event into `H2BranchMerge`. The repaired parent is
     /// supplied by the deferred-parent resolver for the current threshold.
+    #[cfg(test)]
     pub(crate) fn record_compact_merge(
         &mut self,
         value: u16,

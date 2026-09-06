@@ -4,6 +4,11 @@ All notable user-facing changes are documented here. This project follows [Seman
 
 ## [Unreleased]
 
+### Maintenance
+
+- CI freeze cleanup: remove obsolete deferred-repair wrappers, compile compact replay helpers only in tests, and name hierarchical leaf batch result types so `cargo clippy --all-targets -- -D warnings` remains a hard quality gate.
+- `scripts/prepare_for_commit.sh` now mirrors the GitHub CI quality gates before the release build.
+
 ### Changed
 
 - Hierarchical H0/H2 branch-tree history now contracts zero-persistence finalized branches online. Already-generated stale parent references are repaired at finalization time using filtration-aware strict/equality rules, so root replay retains only positive-persistence finalized history.
@@ -25,6 +30,9 @@ All notable user-facing changes are documented here. This project follows [Seman
 
 ### Performance
 
+- Hierarchical leaf slabs now contract zero-persistence finalized history inline before returning their summaries. This preserves the v10 early-attach pruning while preventing diagonal leaf deaths from being materialized and rebucketed centrally. `BETTI_HIER_INLINE_LEAF_HISTORY=0` restores the v10 central-only contraction path in the same binary. Profiling reports raw/retained leaf history, leaf-local zero contractions and parent repairs, and central-history input volume.
+- Hierarchical leaf summaries now finalize non-promoting boundary/internal branch deaths immediately into deferred-repair history instead of exporting them as provisional attach events. The optimization is hierarchical-only; flat/in-memory slab summaries remain unchanged as the correctness reference. Set `BETTI_HIER_EARLY_FINALIZE_LEAF_ATTACHES=0` to restore the v9 leaf behavior in the same binary. Profiling reports leaf one-boundary/internal candidates, early-finalized deaths, propagated attaches, and per-combine input attach/interface counts.
+- Hierarchical H0/H2 fan-in now streams the deterministic ordered child/cross event sequence directly into the pair union-find instead of materializing a merged `Vec<Event>` at every combine. `BETTI_HIER_MATERIALIZE_FANIN=1` retains an A/B reference mode in the same binary; profiling reports `fanin_mode`, streamed-event counts, and materialized-event counts.
 - Replaced hierarchical H0/H2 fan-in concatenate-plus-stable-sort with deterministic linear merging of filtration-ordered child and cross-interface streams. H0 merges five monotone streams in `(value, Attach/Interface/Cross, left-before-right)` order. H2 logically splits mixed Outside/finite attach streams and merges seven monotone streams in `(reverse value, Outside/Attach/Interface/Cross, left-before-right)` order, preserving the former stable-sort tie semantics exactly.
 - Per-combine profiling now reports `merge_seconds`; `sort_seconds` is retained and is zero on the ordered fan-in path for direct comparison with previous profiles.
 
@@ -83,3 +91,11 @@ All notable user-facing changes are documented here. This project follows [Seman
 [Unreleased]: https://github.com/jhnrckmnznrs/stream_betti_curves/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/jhnrckmnznrs/stream_betti_curves/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jhnrckmnznrs/stream_betti_curves/releases/tag/v0.1.0
+
+## Unreleased - recursive hierarchy-history contraction (v12 experimental)
+
+- Generalize inline finalized-history contraction from leaf slabs to every hierarchical fan-in node.
+- Each internal combine now contracts zero-persistence finalized deaths and repairs retained parent references before returning its summary upward.
+- Keep the 65,536-bucket centralized contractor only for the final root handoff.
+- Add `BETTI_HIER_RECURSIVE_HISTORY=0` to restore the v11 central-only internal-history path for same-binary A/B validation.
+- Add recursive-history profiling counters and a randomized symbolic staging validator.
