@@ -11,12 +11,12 @@ use crate::atomic_output::AtomicOutput;
 use crate::connectivity::Connectivity;
 use crate::interface_sparsify_scalar::sparsify_scalar_sublevel_interface;
 use crate::io_scalar::{
-    F32ScalarBlock, ScalarBlock, ScalarTiffStackReader, print_scalar_volume_info,
+    F32ScalarBlock, ScalarBlock, ScalarTiffStackReader, U16ScalarBlock, print_scalar_volume_info,
 };
 use crate::local_pruning::{NeighborhoodComponentPruner, NeighborhoodPruningStats};
 use crate::local_uf_state::LocalUnionFindState;
-use crate::scalar::{F32Key, LocalScalarKey, ScalarKey};
-use crate::scalar_order::{sorted_f32_indices, sorted_scalar_indices};
+use crate::scalar::{F32Key, LocalScalarKey, ScalarKey, U16Key};
+use crate::scalar_order::{sorted_f32_indices, sorted_scalar_indices, sorted_u16_indices};
 use crate::scalar_stream_tuning::{
     ActiveStateStrategy, GlobalH0UnionFindLayoutStrategy, H0PruningCacheStrategy,
     InterfaceStateStrategy, NeighborKernelStrategy, RepresentativeActiveCheckStrategy,
@@ -104,6 +104,7 @@ pub(crate) struct H0SlabPreparationProfile {
     pub(crate) max_rank_observed: u64,
     pub(crate) uf_parent_state_bytes: u64,
     pub(crate) uf_rank_state_bytes: u64,
+    pub(crate) zero_persistence_pairs_elided: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -501,6 +502,7 @@ fn union_active_neighbor_h0_sink<K, F>(
     value: K,
     representative_active_check: RepresentativeActiveCheckStrategy,
     union_kernel: UnionKernelStrategy,
+    zero_persistence_pairs_elided: &mut u64,
     emit: &mut F,
 ) -> Result<()>
 where
@@ -540,6 +542,8 @@ where
             LocalPersistenceAction::FinalPair(pair) => {
                 if pair.birth < pair.death {
                     emit(H0LocalStreamEvent::FinalPair(pair))?;
+                } else {
+                    *zero_persistence_pairs_elided += 1;
                 }
             }
             LocalPersistenceAction::Attach(event) => emit(H0LocalStreamEvent::Attach(event))?,
@@ -571,6 +575,7 @@ fn process_slab_h0_persistence_values_owned_sink<K, F>(
     SlabH0Summary<K>,
     NeighborhoodPruningStats,
     LocalUnionFindStats,
+    u64,
 )>
 where
     K: LocalScalarKey,
@@ -606,6 +611,7 @@ where
         .then(|| local_pruner.linear_offsets(width, height));
     let interface_node_count = u32::try_from(slab_interface_node_count(slice_size, depth))
         .expect("slab interface node count exceeds u32");
+    let mut zero_persistence_pairs_elided = 0u64;
 
     let mut begin = 0usize;
     while begin < order.len() {
@@ -692,6 +698,7 @@ where
                     value,
                     representative_active_check,
                     union_kernel,
+                    &mut zero_persistence_pairs_elided,
                     &mut emit,
                 )?;
             }
@@ -713,6 +720,7 @@ where
         },
         pruning_stats,
         union_find_stats,
+        zero_persistence_pairs_elided,
     ))
 }
 
@@ -1161,6 +1169,7 @@ pub(crate) fn process_slab_h0_persistence_scalar_profiled(
             max_rank_observed: union_find_stats.max_rank_observed,
             uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
             uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided: 0,
         },
     )
 }
@@ -1264,6 +1273,7 @@ pub(crate) fn process_slab_h0_persistence_f32_native_profiled(
             max_rank_observed: union_find_stats.max_rank_observed,
             uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
             uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided: 0,
         },
     )
 }
@@ -1353,14 +1363,15 @@ pub(crate) fn process_slab_h0_persistence_f32_native_owned_profiled(
             max_rank_observed: union_find_stats.max_rank_observed,
             uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
             uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided: 0,
         },
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn process_slab_h0_persistence_f32_native_direct_profiled<F>(
+pub(crate) fn process_slab_h0_persistence_scalar_direct_profiled<F>(
     slab_id: usize,
-    block: F32ScalarBlock,
+    block: ScalarBlock,
     connectivity: Connectivity,
     neighbor_kernel: NeighborKernelStrategy,
     representative_active_check: RepresentativeActiveCheckStrategy,
@@ -1371,32 +1382,33 @@ pub(crate) fn process_slab_h0_persistence_f32_native_direct_profiled<F>(
     uf_layout: UnionFindLayoutStrategy,
     sweep_diagnostics: bool,
     emit: F,
-) -> Result<(SlabH0Summary<F32Key>, H0SlabPreparationProfile)>
+) -> Result<(SlabH0Summary<ScalarKey>, H0SlabPreparationProfile)>
 where
-    F: FnMut(H0LocalStreamEvent<F32Key>) -> Result<()>,
+    F: FnMut(H0LocalStreamEvent<ScalarKey>) -> Result<()>,
 {
     let shape = block.shape;
     let voxel_count = block.values.len();
     let order_start = Instant::now();
-    let order = sorted_f32_indices(&block.values);
+    let order = sorted_scalar_indices(&block.values, block.pixel_type);
     let scalar_order_seconds = order_start.elapsed().as_secs_f64();
     let sweep_start = Instant::now();
-    let (summary, pruning_stats, union_find_stats) = process_slab_h0_persistence_values_owned_sink(
-        slab_id,
-        shape,
-        block.values,
-        order,
-        connectivity,
-        neighbor_kernel,
-        representative_active_check,
-        union_kernel,
-        pruning_cache,
-        active_state,
-        interface_state,
-        uf_layout,
-        sweep_diagnostics,
-        emit,
-    )?;
+    let (summary, pruning_stats, union_find_stats, zero_persistence_pairs_elided) =
+        process_slab_h0_persistence_values_owned_sink(
+            slab_id,
+            shape,
+            block.values,
+            order,
+            connectivity,
+            neighbor_kernel,
+            representative_active_check,
+            union_kernel,
+            pruning_cache,
+            active_state,
+            interface_state,
+            uf_layout,
+            sweep_diagnostics,
+            emit,
+        )?;
     let local_sweep_seconds = sweep_start.elapsed().as_secs_f64();
     Ok((
         summary,
@@ -1441,6 +1453,188 @@ where
             max_rank_observed: union_find_stats.max_rank_observed,
             uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
             uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided,
+        },
+    ))
+}
+
+/// Direct-event H0 leaf processor for compact exact U16 keys.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_slab_h0_persistence_u16_native_direct_profiled<F>(
+    slab_id: usize,
+    block: U16ScalarBlock,
+    connectivity: Connectivity,
+    neighbor_kernel: NeighborKernelStrategy,
+    representative_active_check: RepresentativeActiveCheckStrategy,
+    union_kernel: UnionKernelStrategy,
+    pruning_cache: H0PruningCacheStrategy,
+    active_state: ActiveStateStrategy,
+    interface_state: InterfaceStateStrategy,
+    uf_layout: UnionFindLayoutStrategy,
+    sweep_diagnostics: bool,
+    emit: F,
+) -> Result<(SlabH0Summary<U16Key>, H0SlabPreparationProfile)>
+where
+    F: FnMut(H0LocalStreamEvent<U16Key>) -> Result<()>,
+{
+    let shape = block.shape;
+    let voxel_count = block.values.len();
+    let order_start = Instant::now();
+    let order = sorted_u16_indices(&block.values);
+    let scalar_order_seconds = order_start.elapsed().as_secs_f64();
+    let sweep_start = Instant::now();
+    let (summary, pruning_stats, union_find_stats, zero_persistence_pairs_elided) =
+        process_slab_h0_persistence_values_owned_sink(
+            slab_id,
+            shape,
+            block.values,
+            order,
+            connectivity,
+            neighbor_kernel,
+            representative_active_check,
+            union_kernel,
+            pruning_cache,
+            active_state,
+            interface_state,
+            uf_layout,
+            sweep_diagnostics,
+            emit,
+        )?;
+    let local_sweep_seconds = sweep_start.elapsed().as_secs_f64();
+    Ok((
+        summary,
+        H0SlabPreparationProfile {
+            scalar_order_seconds,
+            local_sweep_seconds,
+            total_voxels: u64::try_from(voxel_count).expect("slab voxel count exceeds u64"),
+            interior_fast_voxels: if matches!(neighbor_kernel, NeighborKernelStrategy::InteriorFast)
+            {
+                u64::try_from(shape[0].saturating_sub(2)).expect("width exceeds u64")
+                    * u64::try_from(shape[1].saturating_sub(2)).expect("height exceeds u64")
+                    * u64::try_from(shape[2].saturating_sub(2)).expect("depth exceeds u64")
+            } else {
+                0
+            },
+            pruning_mask_calls: pruning_stats.mask_calls,
+            active_state_checks: pruning_stats.active_state_checks,
+            active_neighbor_hits: pruning_stats.active_neighbor_hits,
+            representative_visits: pruning_stats.representative_visits,
+            pruning_cache_lookups: pruning_stats.cache_lookups,
+            pruning_cache_hits: pruning_stats.cache_hits,
+            pruning_cache_misses: pruning_stats.cache_misses,
+            component_mask_computations: pruning_stats.component_mask_computations,
+            union_attempts: union_find_stats.union_attempts,
+            successful_unions: union_find_stats.successful_unions,
+            same_root_unions: union_find_stats.same_root_unions,
+            find_calls: union_find_stats.find_calls,
+            find_parent_steps: union_find_stats.find_parent_steps,
+            active_rechecks: union_find_stats.active_rechecks,
+            active_recheck_failures: union_find_stats.active_recheck_failures,
+            root_carry_attempts: union_find_stats.root_carry_attempts,
+            avoided_find_calls: union_find_stats.avoided_find_calls,
+            interface_rep_queries: union_find_stats.interface_rep_queries,
+            interface_rep_writes: union_find_stats.interface_rep_writes,
+            interface_forced_root_unions: union_find_stats.interface_forced_root_unions,
+            interface_interface_unions: union_find_stats.interface_interface_unions,
+            interface_state_bytes: if matches!(interface_state, InterfaceStateStrategy::Vector) {
+                u64::try_from(voxel_count).expect("slab voxel count exceeds u64") * 4
+            } else {
+                0
+            },
+            max_rank_observed: union_find_stats.max_rank_observed,
+            uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
+            uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided,
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_slab_h0_persistence_f32_native_direct_profiled<F>(
+    slab_id: usize,
+    block: F32ScalarBlock,
+    connectivity: Connectivity,
+    neighbor_kernel: NeighborKernelStrategy,
+    representative_active_check: RepresentativeActiveCheckStrategy,
+    union_kernel: UnionKernelStrategy,
+    pruning_cache: H0PruningCacheStrategy,
+    active_state: ActiveStateStrategy,
+    interface_state: InterfaceStateStrategy,
+    uf_layout: UnionFindLayoutStrategy,
+    sweep_diagnostics: bool,
+    emit: F,
+) -> Result<(SlabH0Summary<F32Key>, H0SlabPreparationProfile)>
+where
+    F: FnMut(H0LocalStreamEvent<F32Key>) -> Result<()>,
+{
+    let shape = block.shape;
+    let voxel_count = block.values.len();
+    let order_start = Instant::now();
+    let order = sorted_f32_indices(&block.values);
+    let scalar_order_seconds = order_start.elapsed().as_secs_f64();
+    let sweep_start = Instant::now();
+    let (summary, pruning_stats, union_find_stats, zero_persistence_pairs_elided) =
+        process_slab_h0_persistence_values_owned_sink(
+            slab_id,
+            shape,
+            block.values,
+            order,
+            connectivity,
+            neighbor_kernel,
+            representative_active_check,
+            union_kernel,
+            pruning_cache,
+            active_state,
+            interface_state,
+            uf_layout,
+            sweep_diagnostics,
+            emit,
+        )?;
+    let local_sweep_seconds = sweep_start.elapsed().as_secs_f64();
+    Ok((
+        summary,
+        H0SlabPreparationProfile {
+            scalar_order_seconds,
+            local_sweep_seconds,
+            total_voxels: u64::try_from(voxel_count).expect("slab voxel count exceeds u64"),
+            interior_fast_voxels: if matches!(neighbor_kernel, NeighborKernelStrategy::InteriorFast)
+            {
+                u64::try_from(shape[0].saturating_sub(2)).expect("width exceeds u64")
+                    * u64::try_from(shape[1].saturating_sub(2)).expect("height exceeds u64")
+                    * u64::try_from(shape[2].saturating_sub(2)).expect("depth exceeds u64")
+            } else {
+                0
+            },
+            pruning_mask_calls: pruning_stats.mask_calls,
+            active_state_checks: pruning_stats.active_state_checks,
+            active_neighbor_hits: pruning_stats.active_neighbor_hits,
+            representative_visits: pruning_stats.representative_visits,
+            pruning_cache_lookups: pruning_stats.cache_lookups,
+            pruning_cache_hits: pruning_stats.cache_hits,
+            pruning_cache_misses: pruning_stats.cache_misses,
+            component_mask_computations: pruning_stats.component_mask_computations,
+            union_attempts: union_find_stats.union_attempts,
+            successful_unions: union_find_stats.successful_unions,
+            same_root_unions: union_find_stats.same_root_unions,
+            find_calls: union_find_stats.find_calls,
+            find_parent_steps: union_find_stats.find_parent_steps,
+            active_rechecks: union_find_stats.active_rechecks,
+            active_recheck_failures: union_find_stats.active_recheck_failures,
+            root_carry_attempts: union_find_stats.root_carry_attempts,
+            avoided_find_calls: union_find_stats.avoided_find_calls,
+            interface_rep_queries: union_find_stats.interface_rep_queries,
+            interface_rep_writes: union_find_stats.interface_rep_writes,
+            interface_forced_root_unions: union_find_stats.interface_forced_root_unions,
+            interface_interface_unions: union_find_stats.interface_interface_unions,
+            interface_state_bytes: if matches!(interface_state, InterfaceStateStrategy::Vector) {
+                u64::try_from(voxel_count).expect("slab voxel count exceeds u64") * 4
+            } else {
+                0
+            },
+            max_rank_observed: union_find_stats.max_rank_observed,
+            uf_parent_state_bytes: union_find_stats.uf_parent_state_bytes,
+            uf_rank_state_bytes: union_find_stats.uf_rank_state_bytes,
+            zero_persistence_pairs_elided,
         },
     ))
 }

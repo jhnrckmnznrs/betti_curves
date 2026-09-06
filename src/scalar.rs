@@ -79,6 +79,52 @@ impl ScalarKey {
     }
 }
 
+/// A compact exact key for unsigned 16-bit scalar images.
+///
+/// Values 0..=65535 preserve the source ordering exactly. The extra u32 value
+/// 65536 is reserved as the local H2 Outside marker, so H0/H2 can share the
+/// same four-byte key representation without widening U16 samples to the
+/// canonical eight-byte `ScalarKey` inside streaming persistence kernels.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct U16Key(u32);
+
+impl U16Key {
+    pub(crate) const OUTSIDE_MARKER: Self = Self(65_536);
+
+    #[inline]
+    pub const fn from_u16(value: u16) -> Self {
+        Self(value as u32)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub fn to_u16(self) -> u16 {
+        debug_assert!(self.0 <= u16::MAX as u32);
+        self.0 as u16
+    }
+
+    #[inline]
+    pub fn to_scalar_key(self) -> ScalarKey {
+        ScalarKey::from_u16(self.to_u16())
+    }
+}
+
+impl fmt::Display for U16Key {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.to_u16())
+    }
+}
+
 /// A native-width order-preserving key for a finite IEEE-754 `f32` scalar.
 ///
 /// The unsigned ordering of `F32Key` is exactly the numerical ordering of
@@ -198,6 +244,19 @@ impl LocalScalarKey for ScalarKey {
     }
 }
 
+impl LocalScalarKey for U16Key {
+    #[inline]
+    fn widen(self) -> ScalarKey {
+        debug_assert!(!self.is_outside_marker());
+        self.to_scalar_key()
+    }
+
+    #[inline]
+    fn outside_marker() -> Self {
+        Self::OUTSIDE_MARKER
+    }
+}
+
 impl LocalScalarKey for F32Key {
     #[inline]
     fn widen(self) -> ScalarKey {
@@ -252,6 +311,22 @@ mod tests {
         let f64_max = ScalarKey::from_f64(f64::MAX).unwrap();
         assert!(f64_max < ScalarKey::OUTSIDE_MARKER);
         assert!(ScalarKey::OUTSIDE_MARKER.is_outside_marker());
+    }
+
+    #[test]
+    fn native_u16_key_order_widening_and_outside_marker_are_exact() {
+        let values = [0u16, 1, 42, 9_000, 65_535];
+        let keys: Vec<_> = values.into_iter().map(U16Key::from_u16).collect();
+        for pair in keys.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
+        for value in values {
+            let key = U16Key::from_u16(value);
+            assert_eq!(key.to_u16(), value);
+            assert_eq!(key.to_scalar_key(), ScalarKey::from_u16(value));
+        }
+        assert!(U16Key::from_u16(u16::MAX) < U16Key::OUTSIDE_MARKER);
+        assert!(U16Key::OUTSIDE_MARKER.is_outside_marker());
     }
 
     #[test]

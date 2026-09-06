@@ -1,0 +1,54 @@
+# v23.6 production-consolidation commands
+
+cd ~/Desktop
+rm -rf stream_betti_curves_persistence_v23_6
+mkdir stream_betti_curves_persistence_v23_6
+
+unzip \
+  ~/Downloads/stream_betti_curves_u16_h2_v23_6_production_consolidation.zip \
+  -d stream_betti_curves_persistence_v23_6
+
+cd stream_betti_curves_persistence_v23_6
+
+./scripts/prepare_for_commit.sh
+
+./scripts/check_u16_h2_fast_interface_query_v23_6_freeze.sh \
+  ~/Desktop/stream_betti_curves_git/examples/CX09T1 \
+  target/release/betti_curves
+
+# Production U16 H2 run: explicitly clear the fast-query override so the
+# promoted default is exercised. Keep the other production switches explicit.
+mkdir -p profiles
+unset BETTI_PERSIST_H2_FAST_INTERFACE_QUERY
+BETTI_PERSIST_U16_NATIVE_KEYS=1 \
+BETTI_PERSIST_H2_PLATEAU_ZERO_ELISION=1 \
+BETTI_PERSIST_H2_ROOT_DEDUP=0 \
+target/release/betti_curves \
+  ~/Desktop/stream_betti_curves_git/examples/CX09T1 \
+  16 \
+  26 \
+  h2-scalar-hierarchical-stream \
+  profiles/v23_6_cx09t1_h2.csv \
+  --local-h2-birth-state compact \
+  --global-h2-birth-state compact \
+  --global-h2-uf-layout packed \
+  --neighbor-root-check parent-shortcut \
+  --interface-state root-invariant \
+  --h2-hier-cross-storage direct \
+  --h2-hier-outside-structural-pruning outside-dominated
+
+# Exact legacy/reference escape hatch for regression or ablation only:
+BETTI_PERSIST_H2_FAST_INTERFACE_QUERY=0 \
+target/release/betti_curves \
+  ~/Desktop/stream_betti_curves_git/examples/CX09T1 \
+  16 \
+  26 \
+  h2-scalar-hierarchical-stream \
+  profiles/v23_6_cx09t1_h2_reference.csv \
+  --local-h2-birth-state compact \
+  --global-h2-birth-state compact \
+  --global-h2-uf-layout packed \
+  --neighbor-root-check parent-shortcut \
+  --interface-state root-invariant \
+  --h2-hier-cross-storage direct \
+  --h2-hier-outside-structural-pruning outside-dominated

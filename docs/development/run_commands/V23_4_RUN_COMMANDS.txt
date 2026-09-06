@@ -1,0 +1,27 @@
+cd ~/Desktop
+
+rm -rf stream_betti_curves_persistence_v23_4
+mkdir stream_betti_curves_persistence_v23_4
+
+unzip \
+  ~/Downloads/stream_betti_curves_u16_h2_sweep_structure_v23_4_experimental.zip \
+  -d stream_betti_curves_persistence_v23_4
+
+cd stream_betti_curves_persistence_v23_4
+
+./scripts/prepare_for_commit.sh
+
+mkdir -p profiles
+
+python3 scripts/profile_u16_h2_sweep_structure.py \
+  ~/Desktop/stream_betti_curves_git/examples/CX09T1 \
+  --binary target/release/betti_curves \
+  --slab-depth 16 \
+  --foreground-connectivity 26 \
+  --repeats 1 \
+  --output profiles/v23_4_u16_h2_sweep_structure.csv
+
+zip -j \
+  ~/Desktop/v23_4_u16_h2_sweep_structure_results.zip \
+  profiles/v23_4_u16_h2_sweep_structure.csv \
+  profiles/v23_4_u16_h2_sweep_structure_summary.csv

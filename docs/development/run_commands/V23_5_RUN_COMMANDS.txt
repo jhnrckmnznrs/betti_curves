@@ -1,0 +1,38 @@
+# v23.5 U16 H2 fast root-invariant interface query
+
+cd ~/Desktop
+rm -rf stream_betti_curves_persistence_v23_5
+mkdir stream_betti_curves_persistence_v23_5
+
+unzip \
+  ~/Downloads/stream_betti_curves_u16_h2_fast_interface_query_v23_5_experimental.zip \
+  -d stream_betti_curves_persistence_v23_5
+
+cd stream_betti_curves_persistence_v23_5
+
+./scripts/prepare_for_commit.sh
+
+python3 validation/check_u16_h2_fast_interface_query_equivalence.py \
+  ~/Desktop/stream_betti_curves_git/examples/CX09T1 \
+  --binary target/release/betti_curves \
+  --slab-depths 16 32 64 \
+  --foreground-connectivity 26
+
+mkdir -p profiles
+
+python3 scripts/profile_u16_h2_fast_interface_query.py \
+  ~/Desktop/stream_betti_curves_git/examples/CX09T1 \
+  --binary target/release/betti_curves \
+  --slab-depths 16 32 64 \
+  --foreground-connectivity 26 \
+  --warmup 1 \
+  --repeats 11 \
+  --start-with reference \
+  --output profiles/v23_5_u16_h2_fast_interface_query_paired.csv
+
+zip -j \
+  ~/Desktop/v23_5_u16_h2_fast_interface_query_results.zip \
+  profiles/v23_5_u16_h2_fast_interface_query_paired.csv \
+  profiles/v23_5_u16_h2_fast_interface_query_paired_summary.csv \
+  profiles/v23_5_u16_h2_fast_interface_query_paired_pairs.csv \
+  profiles/v23_5_u16_h2_fast_interface_query_paired_paired_summary.csv

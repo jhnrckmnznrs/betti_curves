@@ -1,0 +1,16 @@
+v23.5.1 fast-interface-query confirmation
+verdict=KEEP_EXPERIMENTAL
+
+PASS slab_depth_is_16: d=16
+PASS exactly_31_pairs: pairs=31
+PASS median_wall_improves: median_wall=-1.1559%
+PASS median_sweep_improves: median_sweep=-1.5743%
+FAIL wall_wins_at_least_23: wins=19/31
+FAIL wall_sign_test_p_lt_0_05: p=0.28104152
+PASS reference_first_median_improves: ref-first=-0.5701%
+PASS candidate_first_median_improves: cand-first=-2.2502%
+
+Interpretation:
+PROMOTE_CANDIDATE means the pre-registered performance gate passed;
+the source default should only be flipped in a separate freeze change after
+reviewing exact-equivalence output and the raw paired CSV for anomalies.

@@ -1,0 +1,4 @@
+slab_depth,reference_neighbor_find_calls,candidate_neighbor_find_calls,neighbor_finds_avoided,reference_neighbor_find_zero_hop,candidate_neighbor_find_zero_hop,reference_neighbor_find_parent_steps,candidate_neighbor_find_parent_steps,parent_steps_delta,reference_direct_parent_hits,candidate_direct_parent_hits
+16,36636993.0,35785885.0,851108.0,851108.0,0.0,40587412.0,40587412.0,0.0,61917519.0,61917519.0
+32,36097496.0,35284525.0,812971.0,812971.0,0.0,39245005.0,39245005.0,0.0,63508080.0,63508080.0
+64,36301610.0,35507069.0,794541.0,794541.0,0.0,39729062.0,39729062.0,0.0,63829498.0,63829498.0

@@ -17,13 +17,15 @@ use crate::io_scalar::{
 use crate::memory_audit::{emit as emit_memory_snapshot, vec_capacity_bytes};
 use crate::persistence_h2_scalar::{
     AttachEvent, CompactGlobalBackgroundPersistenceUnionFind, FinitePair, H2LocalStreamEvent,
-    H2SlabPreparationProfile, InterfaceMergeEvent, OutsideEvent, SlabH2Summary,
-    StreamingGlobalBackgroundPersistenceUnionFind,
+    H2RootDedupProfile, H2SlabPreparationProfile, InterfaceMergeEvent, OutsideEvent, SlabH2Summary,
+    StreamingGlobalBackgroundPersistenceUnionFind, h2_fast_interface_query_enabled,
     process_slab_h2_persistence_f32_native_direct_profiled,
     process_slab_h2_persistence_f32_native_profiled_with_memory_audit,
     process_slab_h2_persistence_profiled_with_memory_audit,
+    process_slab_h2_persistence_scalar_direct_profiled,
+    process_slab_h2_persistence_u16_native_direct_profiled,
 };
-use crate::scalar::{F32Key, LocalScalarKey, ScalarKey};
+use crate::scalar::{F32Key, LocalScalarKey, ScalarKey, U16Key};
 use crate::scalar_order::RadixScalarKey;
 use crate::scalar_stream_tuning::{
     EventOrderStrategy, F32KeyMode, GlobalH2BirthStateStrategy, H2HierCrossStorageStrategy,
@@ -32,6 +34,31 @@ use crate::scalar_stream_tuning::{
 };
 use crate::temp_runs::TempRunDirectory;
 use crate::tiff_paths::find_tiff_stack_directories;
+
+fn u16_native_persistence_enabled() -> bool {
+    !matches!(
+        std::env::var("BETTI_PERSIST_U16_NATIVE_KEYS")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+fn u16_h2_plateau_zero_elision_enabled() -> bool {
+    !matches!(
+        std::env::var("BETTI_PERSIST_H2_PLATEAU_ZERO_ELISION")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+fn u16_h2_root_dedup_enabled() -> bool {
+    matches!(
+        std::env::var("BETTI_PERSIST_H2_ROOT_DEDUP").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
 
 #[derive(Debug, Clone)]
 struct SlabDescriptor {
@@ -149,6 +176,26 @@ impl DiskScalarKey for ScalarKey {
         let mut bytes = [0u8; 8];
         if read_exact_or_eof(reader, &mut bytes)? {
             Ok(Some(ScalarKey::from_raw(u64::from_le_bytes(bytes))))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl DiskScalarKey for U16Key {
+    const DISK_BYTES: usize = 4;
+
+    #[inline]
+    fn write_disk(self, writer: &mut BufWriter<File>) -> Result<()> {
+        writer.write_all(&self.raw().to_le_bytes())?;
+        Ok(())
+    }
+
+    #[inline]
+    fn read_disk(reader: &mut BufReader<File>) -> Result<Option<Self>> {
+        let mut bytes = [0u8; 4];
+        if read_exact_or_eof(reader, &mut bytes)? {
+            Ok(Some(U16Key::from_raw(u32::from_le_bytes(bytes))))
         } else {
             Ok(None)
         }
@@ -593,7 +640,19 @@ struct DetailedPreparationProfile {
     avoided_find_calls: u64,
     direct_parent_checks: u64,
     direct_parent_hits: u64,
+    two_hop_parent_checks: u64,
+    two_hop_parent_hits: u64,
     avoided_neighbor_find_calls: u64,
+    neighbor_find_calls: u64,
+    neighbor_find_parent_steps: u64,
+    neighbor_find_zero_hop: u64,
+    neighbor_find_one_hop: u64,
+    neighbor_find_two_hop: u64,
+    neighbor_find_gt_two_hop: u64,
+    same_root_neighbor_find_zero_hop: u64,
+    same_root_neighbor_find_one_hop: u64,
+    same_root_neighbor_find_two_hop: u64,
+    same_root_neighbor_find_gt_two_hop: u64,
     interface_rep_queries: u64,
     interface_rep_writes: u64,
     interface_forced_root_unions: u64,
@@ -747,7 +806,23 @@ where
         preparation_profile.avoided_find_calls += slab_profile.avoided_find_calls;
         preparation_profile.direct_parent_checks += slab_profile.direct_parent_checks;
         preparation_profile.direct_parent_hits += slab_profile.direct_parent_hits;
+        preparation_profile.two_hop_parent_checks += slab_profile.two_hop_parent_checks;
+        preparation_profile.two_hop_parent_hits += slab_profile.two_hop_parent_hits;
         preparation_profile.avoided_neighbor_find_calls += slab_profile.avoided_neighbor_find_calls;
+        preparation_profile.neighbor_find_calls += slab_profile.neighbor_find_calls;
+        preparation_profile.neighbor_find_parent_steps += slab_profile.neighbor_find_parent_steps;
+        preparation_profile.neighbor_find_zero_hop += slab_profile.neighbor_find_zero_hop;
+        preparation_profile.neighbor_find_one_hop += slab_profile.neighbor_find_one_hop;
+        preparation_profile.neighbor_find_two_hop += slab_profile.neighbor_find_two_hop;
+        preparation_profile.neighbor_find_gt_two_hop += slab_profile.neighbor_find_gt_two_hop;
+        preparation_profile.same_root_neighbor_find_zero_hop +=
+            slab_profile.same_root_neighbor_find_zero_hop;
+        preparation_profile.same_root_neighbor_find_one_hop +=
+            slab_profile.same_root_neighbor_find_one_hop;
+        preparation_profile.same_root_neighbor_find_two_hop +=
+            slab_profile.same_root_neighbor_find_two_hop;
+        preparation_profile.same_root_neighbor_find_gt_two_hop +=
+            slab_profile.same_root_neighbor_find_gt_two_hop;
         preparation_profile.interface_rep_queries += slab_profile.interface_rep_queries;
         preparation_profile.interface_rep_writes += slab_profile.interface_rep_writes;
         preparation_profile.interface_forced_root_unions +=
@@ -2042,7 +2117,9 @@ representative_visits={} pruning_cache_hits={} pruning_cache_misses={} \
 component_mask_computations={} union_attempts={} successful_unions={} \
 same_root_unions={} find_calls={} find_parent_steps={} active_rechecks={} \
 active_recheck_failures={} root_carry_attempts={} avoided_find_calls={} \
-direct_parent_checks={} direct_parent_hits={} avoided_neighbor_find_calls={} \
+direct_parent_checks={} direct_parent_hits={} two_hop_parent_checks={} two_hop_parent_hits={} avoided_neighbor_find_calls={} \
+neighbor_find_calls={} neighbor_find_parent_steps={} neighbor_find_zero_hop={} neighbor_find_one_hop={} neighbor_find_two_hop={} neighbor_find_gt_two_hop={} \
+same_root_neighbor_find_zero_hop={} same_root_neighbor_find_one_hop={} same_root_neighbor_find_two_hop={} same_root_neighbor_find_gt_two_hop={} \
 interface_rep_queries={} interface_rep_writes={} interface_forced_root_unions={} \
 interface_interface_unions={} interface_state_bytes={} max_rank_observed={} uf_parent_state_bytes={} uf_rank_state_bytes={}",
             detailed.pruning_mask_calls,
@@ -2063,7 +2140,19 @@ interface_interface_unions={} interface_state_bytes={} max_rank_observed={} uf_p
             detailed.avoided_find_calls,
             detailed.direct_parent_checks,
             detailed.direct_parent_hits,
+            detailed.two_hop_parent_checks,
+            detailed.two_hop_parent_hits,
             detailed.avoided_neighbor_find_calls,
+            detailed.neighbor_find_calls,
+            detailed.neighbor_find_parent_steps,
+            detailed.neighbor_find_zero_hop,
+            detailed.neighbor_find_one_hop,
+            detailed.neighbor_find_two_hop,
+            detailed.neighbor_find_gt_two_hop,
+            detailed.same_root_neighbor_find_zero_hop,
+            detailed.same_root_neighbor_find_one_hop,
+            detailed.same_root_neighbor_find_two_hop,
+            detailed.same_root_neighbor_find_gt_two_hop,
             detailed.interface_rep_queries,
             detailed.interface_rep_writes,
             detailed.interface_forced_root_unions,
@@ -3547,6 +3636,327 @@ fn finalize_disk_h2_pair<K: DiskScalarKey>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn prepare_disk_h2_leaf_scalar(
+    volume: &ScalarTiffStackReader,
+    slab_id: usize,
+    z0: usize,
+    z1: usize,
+    background_connectivity: Connectivity,
+    directory: &Path,
+    summary_id: usize,
+    pair_writer: &mut BufWriter<File>,
+    tuning: ScalarStreamTuning,
+) -> Result<(
+    DiskHierarchicalH2Summary<ScalarKey>,
+    H2SlabPreparationProfile,
+    u64,
+    u64,
+    u64,
+)> {
+    let attach_path = directory.join(format!("h2_hier_attach_{summary_id:06}.bin"));
+    let outside_path = directory.join(format!("h2_hier_outside_{summary_id:06}.bin"));
+    let interface_path = directory.join(format!("h2_hier_interface_{summary_id:06}.bin"));
+    let mut attach_writer = BufWriter::new(File::create(&attach_path)?);
+    let mut outside_writer = BufWriter::new(File::create(&outside_path)?);
+    let mut interface_writer = BufWriter::new(File::create(&interface_path)?);
+    let mut previous_attach_value: Option<ScalarKey> = None;
+    let mut previous_outside_value: Option<ScalarKey> = None;
+    let mut previous_interface_value: Option<ScalarKey> = None;
+    let mut final_pairs = 0u64;
+    let mut attach_events = 0u64;
+    let mut outside_events = 0u64;
+
+    let (block, _read_profile) = volume.read_z_slab_profiled(z0, z1)?;
+    let (summary, slab_profile) = process_slab_h2_persistence_scalar_direct_profiled(
+        slab_id,
+        z0,
+        block,
+        volume.width,
+        volume.height,
+        volume.depth,
+        background_connectivity,
+        tuning.neighbor_kernel,
+        tuning.representative_active_check,
+        tuning.union_kernel,
+        tuning.neighbor_root_check,
+        tuning.active_state,
+        tuning.interface_state,
+        tuning.uf_layout,
+        tuning.local_h2_birth_state,
+        tuning.sweep_diagnostics,
+        true,
+        matches!(
+            tuning.h2_hier_outside_structural_pruning,
+            H2HierOutsideStructuralPruningStrategy::OutsideDominated
+        ),
+        |event| {
+            match event {
+                H2LocalStreamEvent::FinalPair(pair) => {
+                    if pair.birth < pair.death {
+                        final_pairs += 1;
+                        write_finite_pair(pair_writer, pair)?;
+                    }
+                }
+                H2LocalStreamEvent::Attach(event) => {
+                    if previous_attach_value.is_some_and(|value| event.value > value) {
+                        bail!(
+                            "hierarchical direct H2 attach events are not monotone within slab {slab_id}"
+                        );
+                    }
+                    previous_attach_value = Some(event.value);
+                    attach_events += 1;
+                    write_attach_event(
+                        &mut attach_writer,
+                        AttachDiskEvent {
+                            value: event.value,
+                            node: event.interface_node,
+                            branch_birth: event.branch_birth,
+                        },
+                    )?;
+                }
+                H2LocalStreamEvent::Outside(event) => {
+                    if previous_outside_value.is_some_and(|value| event.value > value) {
+                        bail!(
+                            "hierarchical direct H2 outside events are not monotone within slab {slab_id}"
+                        );
+                    }
+                    previous_outside_value = Some(event.value);
+                    outside_events += 1;
+                    write_outside_event(
+                        &mut outside_writer,
+                        OutsideDiskEvent {
+                            value: event.value,
+                            node: event.interface_node,
+                        },
+                    )?;
+                }
+                H2LocalStreamEvent::InterfaceMerge(event) => {
+                    if previous_interface_value.is_some_and(|value| event.value > value) {
+                        bail!(
+                            "hierarchical direct H2 interface events are not monotone within slab {slab_id}"
+                        );
+                    }
+                    previous_interface_value = Some(event.value);
+                    write_pair_event(
+                        &mut interface_writer,
+                        PairEvent {
+                            value: event.value,
+                            a: event.a,
+                            b: event.b,
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    attach_writer.flush()?;
+    outside_writer.flush()?;
+    interface_writer.flush()?;
+
+    println!(
+        "PROFILE_H2_HIER_STREAM_LEAF slab={} z0={} z1={} final_pairs={} attach_events={} outside_events={} attach_bytes={} outside_bytes={} interface_bytes={} local_birth_storage=reuse-input local_event_storage=direct local_attach_pruning=elder-dominated local_outside_structural_pruning={}",
+        slab_id,
+        z0,
+        z1,
+        final_pairs,
+        attach_events,
+        outside_events,
+        path_bytes(&attach_path)?,
+        path_bytes(&outside_path)?,
+        path_bytes(&interface_path)?,
+        tuning.h2_hier_outside_structural_pruning.as_str(),
+    );
+
+    Ok((
+        DiskHierarchicalH2Summary {
+            z0,
+            z1,
+            width: volume.width,
+            height: volume.height,
+            interface_node_count: summary.interface_node_count,
+            lower_values: summary.z_min_face.values,
+            upper_values: summary.z_max_face.values,
+            attach_path,
+            outside_path,
+            interface_path,
+        },
+        slab_profile,
+        final_pairs,
+        attach_events,
+        outside_events,
+    ))
+}
+
+type PreparedU16H2Leaf = (
+    DiskHierarchicalH2Summary<U16Key>,
+    H2SlabPreparationProfile,
+    H2RootDedupProfile,
+    u64,
+    u64,
+    u64,
+    u64,
+);
+
+/// Prepare one compact-key U16 H2 hierarchical leaf.
+#[allow(clippy::too_many_arguments)]
+fn prepare_disk_h2_leaf_u16(
+    volume: &ScalarTiffStackReader,
+    slab_id: usize,
+    z0: usize,
+    z1: usize,
+    background_connectivity: Connectivity,
+    directory: &Path,
+    summary_id: usize,
+    pair_writer: &mut BufWriter<File>,
+    tuning: ScalarStreamTuning,
+    plateau_zero_elision: bool,
+    root_dedup: bool,
+) -> Result<PreparedU16H2Leaf> {
+    let attach_path = directory.join(format!("h2_hier_attach_{summary_id:06}.bin"));
+    let outside_path = directory.join(format!("h2_hier_outside_{summary_id:06}.bin"));
+    let interface_path = directory.join(format!("h2_hier_interface_{summary_id:06}.bin"));
+    let mut attach_writer = BufWriter::new(File::create(&attach_path)?);
+    let mut outside_writer = BufWriter::new(File::create(&outside_path)?);
+    let mut interface_writer = BufWriter::new(File::create(&interface_path)?);
+    let mut previous_attach_value: Option<U16Key> = None;
+    let mut previous_outside_value: Option<U16Key> = None;
+    let mut previous_interface_value: Option<U16Key> = None;
+    let mut final_pairs = 0u64;
+    let mut attach_events = 0u64;
+    let mut outside_events = 0u64;
+    let mut interface_events = 0u64;
+
+    let (block, _read_profile) = volume.read_z_slab_u16_native_profiled(z0, z1)?;
+    let (summary, slab_profile, root_dedup_profile) =
+        process_slab_h2_persistence_u16_native_direct_profiled(
+            slab_id,
+            z0,
+            block,
+            volume.width,
+            volume.height,
+            volume.depth,
+            background_connectivity,
+            tuning.neighbor_kernel,
+            tuning.representative_active_check,
+            tuning.union_kernel,
+            tuning.neighbor_root_check,
+            tuning.active_state,
+            tuning.interface_state,
+            tuning.uf_layout,
+            tuning.local_h2_birth_state,
+            tuning.sweep_diagnostics,
+            true,
+            matches!(
+                tuning.h2_hier_outside_structural_pruning,
+                H2HierOutsideStructuralPruningStrategy::OutsideDominated
+            ),
+            plateau_zero_elision,
+            root_dedup,
+            |event| {
+                match event {
+                    H2LocalStreamEvent::FinalPair(pair) => {
+                        if pair.birth < pair.death {
+                            final_pairs += 1;
+                            write_finite_pair(pair_writer, pair)?;
+                        }
+                    }
+                    H2LocalStreamEvent::Attach(event) => {
+                        if previous_attach_value.is_some_and(|value| event.value > value) {
+                            bail!(
+                                "hierarchical direct H2 attach events are not monotone within slab {slab_id}"
+                            );
+                        }
+                        previous_attach_value = Some(event.value);
+                        attach_events += 1;
+                        write_attach_event(
+                            &mut attach_writer,
+                            AttachDiskEvent {
+                                value: event.value,
+                                node: event.interface_node,
+                                branch_birth: event.branch_birth,
+                            },
+                        )?;
+                    }
+                    H2LocalStreamEvent::Outside(event) => {
+                        if previous_outside_value.is_some_and(|value| event.value > value) {
+                            bail!(
+                                "hierarchical direct H2 outside events are not monotone within slab {slab_id}"
+                            );
+                        }
+                        previous_outside_value = Some(event.value);
+                        outside_events += 1;
+                        write_outside_event(
+                            &mut outside_writer,
+                            OutsideDiskEvent {
+                                value: event.value,
+                                node: event.interface_node,
+                            },
+                        )?;
+                    }
+                    H2LocalStreamEvent::InterfaceMerge(event) => {
+                        interface_events += 1;
+                        if previous_interface_value.is_some_and(|value| event.value > value) {
+                            bail!(
+                                "hierarchical direct H2 interface events are not monotone within slab {slab_id}"
+                            );
+                        }
+                        previous_interface_value = Some(event.value);
+                        write_pair_event(
+                            &mut interface_writer,
+                            PairEvent {
+                                value: event.value,
+                                a: event.a,
+                                b: event.b,
+                            },
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    attach_writer.flush()?;
+    outside_writer.flush()?;
+    interface_writer.flush()?;
+
+    println!(
+        "PROFILE_H2_HIER_STREAM_LEAF slab={} z0={} z1={} final_pairs={} attach_events={} outside_events={} interface_events={} attach_bytes={} outside_bytes={} interface_bytes={} local_birth_storage=reuse-input local_event_storage=direct local_attach_pruning=elder-dominated local_outside_structural_pruning={}",
+        slab_id,
+        z0,
+        z1,
+        final_pairs,
+        attach_events,
+        outside_events,
+        interface_events,
+        path_bytes(&attach_path)?,
+        path_bytes(&outside_path)?,
+        path_bytes(&interface_path)?,
+        tuning.h2_hier_outside_structural_pruning.as_str(),
+    );
+
+    Ok((
+        DiskHierarchicalH2Summary {
+            z0,
+            z1,
+            width: volume.width,
+            height: volume.height,
+            interface_node_count: summary.interface_node_count,
+            lower_values: summary.z_min_face.values,
+            upper_values: summary.z_max_face.values,
+            attach_path,
+            outside_path,
+            interface_path,
+        },
+        slab_profile,
+        root_dedup_profile,
+        final_pairs,
+        attach_events,
+        outside_events,
+        interface_events,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_disk_h2_leaf_f32(
     volume: &ScalarTiffStackReader,
     slab_id: usize,
@@ -3764,6 +4174,816 @@ fn finalize_single_disk_h2_root<K: DiskScalarKey>(
     Ok((root.interface_node_count as usize, state_bytes))
 }
 
+/// Compact native-U16 hierarchical H2 persistence path.
+fn compute_h2_persistence_scalar_hierarchical_stream_u16_zslabs(
+    volume: &ScalarTiffStackReader,
+    slab_depth: usize,
+    background_connectivity: Connectivity,
+    output_path: &Path,
+    tuning: ScalarStreamTuning,
+) -> Result<ScalarH2PersistenceStats> {
+    let start = Instant::now();
+    let plateau_zero_elision = u16_h2_plateau_zero_elision_enabled();
+    let root_dedup = u16_h2_root_dedup_enabled();
+    if !matches!(
+        tuning.local_h2_birth_state,
+        crate::scalar_stream_tuning::LocalH2BirthStateStrategy::Compact
+    ) {
+        bail!("h2-scalar-hierarchical-stream requires --local-h2-birth-state compact");
+    }
+    if !matches!(
+        tuning.global_h2_birth_state,
+        GlobalH2BirthStateStrategy::Compact
+    ) {
+        bail!("h2-scalar-hierarchical-stream requires --global-h2-birth-state compact");
+    }
+    if !matches!(
+        tuning.global_h2_uf_layout,
+        crate::scalar_stream_tuning::GlobalH2UnionFindLayoutStrategy::Packed
+    ) {
+        bail!("h2-scalar-hierarchical-stream requires --global-h2-uf-layout packed");
+    }
+
+    let temp_directory = TempRunDirectory::create("h2_scalar_hierarchical_stream_runs")?;
+    println!(
+        "Scalar hierarchical H2 streaming temporary directory: {:?}",
+        temp_directory.path()
+    );
+    let pairs_path = temp_directory.path().join("h2_hier_finalized_pairs.bin");
+    let mut pair_writer = BufWriter::new(File::create(&pairs_path)?);
+
+    let mut ranges = Vec::new();
+    let mut z0 = 0usize;
+    let mut slab_id = 0usize;
+    while z0 < volume.depth {
+        let z1 = z0.saturating_add(slab_depth).min(volume.depth);
+        ranges.push((slab_id, z0, z1));
+        slab_id += 1;
+        z0 = z1;
+    }
+    let face_size = volume
+        .width
+        .checked_mul(volume.height)
+        .expect("hierarchical H2 face size overflow");
+    let planned_pair_nodes = if ranges.len() > 1 {
+        face_size.saturating_mul(4)
+    } else if volume.depth == 1 {
+        face_size
+    } else {
+        face_size.saturating_mul(2)
+    };
+    let planned_pair_state_bytes = u64::try_from(planned_pair_nodes)
+        .expect("hierarchical H2 planned pair nodes exceed u64")
+        .saturating_mul(8);
+    println!(
+        "Scalar hierarchical H2 storage: pipeline=u16-native32-direct-{}-fanin-outside disk_key_bytes=4 pair_state_bytes_per_node=8 planned_max_pair_nodes={} planned_max_pair_state_bytes={}",
+        tuning.h2_hier_cross_storage.as_str(),
+        planned_pair_nodes,
+        planned_pair_state_bytes,
+    );
+    println!(
+        "PROFILE_CONFIG scalar_h2_hierarchical_stream f32_key_mode={} interface_order={} event_order={} neighbor_kernel={} representative_active_check={} union_kernel={} neighbor_root_check={} active_state={} interface_state={} uf_layout={} local_h2_birth_state={} global_h2_birth_state={} global_h2_uf_layout={} local_birth_storage=reuse-input local_event_storage=direct local_attach_pruning=elder-dominated hierarchy_attach_pruning=elder-dominated outside_state=distinguished h2_hier_cross_storage={} h2_hier_outside_structural_pruning={} h2_plateau_zero_elision={} h2_root_dedup={} h2_fast_interface_query={}",
+        tuning.f32_key_mode.as_str(),
+        tuning.interface_order.as_str(),
+        tuning.event_order.as_str(),
+        tuning.neighbor_kernel.as_str(),
+        tuning.representative_active_check.as_str(),
+        tuning.union_kernel.as_str(),
+        tuning.neighbor_root_check.as_str(),
+        tuning.active_state.as_str(),
+        tuning.interface_state.as_str(),
+        tuning.uf_layout.as_str(),
+        tuning.local_h2_birth_state.as_str(),
+        tuning.global_h2_birth_state.as_str(),
+        tuning.global_h2_uf_layout.as_str(),
+        tuning.h2_hier_cross_storage.as_str(),
+        tuning.h2_hier_outside_structural_pruning.as_str(),
+        if plateau_zero_elision { "on" } else { "off" },
+        if root_dedup { "on" } else { "off" },
+        if h2_fast_interface_query_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+    );
+
+    let mut slots: Vec<Option<DiskHierarchicalH2Summary<U16Key>>> = Vec::new();
+    let mut next_summary_id = ranges.len();
+    let mut combines = 0usize;
+    let mut max_live_summaries = 0usize;
+    let mut max_pair_nodes = 0usize;
+    let mut max_pair_state_bytes = 0u64;
+    let mut attach_finalized_early_total = 0u64;
+    let mut attach_propagated_total = 0u64;
+    let mut outside_propagated_total = 0u64;
+    let mut outside_structural_elided_total = 0u64;
+    let mut leaf_final_pairs_total = 0u64;
+    let mut leaf_attach_events_total = 0u64;
+    let mut leaf_outside_events_total = 0u64;
+    let mut leaf_interface_events_total = 0u64;
+    let mut leaf_zero_persistence_pairs_elided = 0u64;
+    let mut leaf_total_voxels = 0u64;
+    let mut leaf_interior_fast_voxels = 0u64;
+    let mut leaf_pruning_mask_calls = 0u64;
+    let mut leaf_active_state_checks = 0u64;
+    let mut leaf_active_neighbor_hits = 0u64;
+    let mut leaf_representative_visits = 0u64;
+    let mut leaf_pruning_cache_hits = 0u64;
+    let mut leaf_pruning_cache_misses = 0u64;
+    let mut leaf_component_mask_computations = 0u64;
+    let mut leaf_interface_rep_queries = 0u64;
+    let mut leaf_interface_rep_writes = 0u64;
+    let mut leaf_interface_forced_root_unions = 0u64;
+    let mut leaf_interface_interface_unions = 0u64;
+    let mut leaf_successful_unions = 0u64;
+    let mut leaf_union_attempts = 0u64;
+    let mut leaf_same_root_unions = 0u64;
+    let mut leaf_root_dedup_inputs = 0u64;
+    let mut leaf_root_dedup_unique = 0u64;
+    let mut leaf_root_dedup_skipped = 0u64;
+    let mut leaf_scalar_order_seconds = 0.0f64;
+    let mut leaf_local_sweep_seconds = 0.0f64;
+    let mut leaf_direct_parent_checks = 0u64;
+    let mut leaf_direct_parent_hits = 0u64;
+    let mut leaf_two_hop_parent_checks = 0u64;
+    let mut leaf_two_hop_parent_hits = 0u64;
+    let mut leaf_avoided_neighbor_find_calls = 0u64;
+    let mut leaf_neighbor_find_calls = 0u64;
+    let mut leaf_neighbor_find_parent_steps = 0u64;
+    let mut leaf_neighbor_find_zero_hop = 0u64;
+    let mut leaf_neighbor_find_one_hop = 0u64;
+    let mut leaf_neighbor_find_two_hop = 0u64;
+    let mut leaf_neighbor_find_gt_two_hop = 0u64;
+    let mut leaf_same_root_neighbor_find_zero_hop = 0u64;
+    let mut leaf_same_root_neighbor_find_one_hop = 0u64;
+    let mut leaf_same_root_neighbor_find_two_hop = 0u64;
+    let mut leaf_same_root_neighbor_find_gt_two_hop = 0u64;
+    let mut final_children: Option<(
+        DiskHierarchicalH2Summary<U16Key>,
+        DiskHierarchicalH2Summary<U16Key>,
+    )> = None;
+
+    'leaf_loop: for &(leaf_id, leaf_z0, leaf_z1) in &ranges {
+        println!("Preparing optimized hierarchical H2 leaf {leaf_id}: z={leaf_z0}..{leaf_z1}");
+        let (
+            mut current,
+            profile,
+            root_profile,
+            leaf_pairs,
+            leaf_attach,
+            leaf_outside,
+            leaf_interface,
+        ) = prepare_disk_h2_leaf_u16(
+            volume,
+            leaf_id,
+            leaf_z0,
+            leaf_z1,
+            background_connectivity,
+            temp_directory.path(),
+            leaf_id,
+            &mut pair_writer,
+            tuning,
+            plateau_zero_elision,
+            root_dedup,
+        )?;
+        leaf_final_pairs_total += leaf_pairs;
+        leaf_attach_events_total += leaf_attach;
+        leaf_outside_events_total += leaf_outside;
+        leaf_interface_events_total += leaf_interface;
+        leaf_total_voxels += profile.total_voxels;
+        leaf_interior_fast_voxels += profile.interior_fast_voxels;
+        leaf_pruning_mask_calls += profile.pruning_mask_calls;
+        leaf_active_state_checks += profile.active_state_checks;
+        leaf_active_neighbor_hits += profile.active_neighbor_hits;
+        leaf_representative_visits += profile.representative_visits;
+        leaf_pruning_cache_hits += profile.pruning_cache_hits;
+        leaf_pruning_cache_misses += profile.pruning_cache_misses;
+        leaf_component_mask_computations += profile.component_mask_computations;
+        leaf_interface_rep_queries += profile.interface_rep_queries;
+        leaf_interface_rep_writes += profile.interface_rep_writes;
+        leaf_interface_forced_root_unions += profile.interface_forced_root_unions;
+        leaf_interface_interface_unions += profile.interface_interface_unions;
+        leaf_zero_persistence_pairs_elided += profile.zero_persistence_pairs_elided;
+        leaf_successful_unions += root_profile.successful_unions;
+        leaf_union_attempts += root_profile.union_attempts;
+        leaf_same_root_unions += root_profile.same_root_unions;
+        leaf_root_dedup_inputs += root_profile.inputs;
+        leaf_root_dedup_unique += root_profile.unique_roots;
+        leaf_root_dedup_skipped += root_profile.skipped_duplicate_roots;
+        leaf_scalar_order_seconds += profile.scalar_order_seconds;
+        leaf_local_sweep_seconds += profile.local_sweep_seconds;
+        leaf_direct_parent_checks += profile.direct_parent_checks;
+        leaf_direct_parent_hits += profile.direct_parent_hits;
+        leaf_two_hop_parent_checks += profile.two_hop_parent_checks;
+        leaf_two_hop_parent_hits += profile.two_hop_parent_hits;
+        leaf_avoided_neighbor_find_calls += profile.avoided_neighbor_find_calls;
+        leaf_neighbor_find_calls += profile.neighbor_find_calls;
+        leaf_neighbor_find_parent_steps += profile.neighbor_find_parent_steps;
+        leaf_neighbor_find_zero_hop += profile.neighbor_find_zero_hop;
+        leaf_neighbor_find_one_hop += profile.neighbor_find_one_hop;
+        leaf_neighbor_find_two_hop += profile.neighbor_find_two_hop;
+        leaf_neighbor_find_gt_two_hop += profile.neighbor_find_gt_two_hop;
+        leaf_same_root_neighbor_find_zero_hop += profile.same_root_neighbor_find_zero_hop;
+        leaf_same_root_neighbor_find_one_hop += profile.same_root_neighbor_find_one_hop;
+        leaf_same_root_neighbor_find_two_hop += profile.same_root_neighbor_find_two_hop;
+        leaf_same_root_neighbor_find_gt_two_hop += profile.same_root_neighbor_find_gt_two_hop;
+        let mut level = 0usize;
+        loop {
+            if level == slots.len() {
+                slots.push(Some(current));
+                break;
+            }
+            if let Some(left) = slots[level].take() {
+                let covers_entire_volume = ranges.len() > 1
+                    && leaf_id + 1 == ranges.len()
+                    && left.z0 == 0
+                    && current.z1 == volume.depth;
+                if covers_entire_volume {
+                    final_children = Some((left, current));
+                    break 'leaf_loop;
+                }
+                println!(
+                    "Optimized hierarchical H2 fan-in level {level}: z={}..{} + z={}..{}",
+                    left.z0, left.z1, current.z0, current.z1,
+                );
+                let (
+                    parent,
+                    pair_nodes,
+                    pair_state_bytes,
+                    finalized,
+                    propagated,
+                    outside_propagated,
+                    outside_structural_elided,
+                ) = match tuning.h2_hier_cross_storage {
+                    H2HierCrossStorageStrategy::Disk => combine_disk_h2_summaries(
+                        left,
+                        current,
+                        background_connectivity,
+                        tuning.interface_order,
+                        temp_directory.path(),
+                        next_summary_id,
+                        &mut pair_writer,
+                        matches!(
+                            tuning.h2_hier_outside_structural_pruning,
+                            H2HierOutsideStructuralPruningStrategy::OutsideDominated
+                        ),
+                    )?,
+                    H2HierCrossStorageStrategy::Direct => combine_disk_h2_summaries_direct_cross(
+                        left,
+                        current,
+                        background_connectivity,
+                        tuning.interface_order,
+                        temp_directory.path(),
+                        next_summary_id,
+                        &mut pair_writer,
+                        matches!(
+                            tuning.h2_hier_outside_structural_pruning,
+                            H2HierOutsideStructuralPruningStrategy::OutsideDominated
+                        ),
+                    )?,
+                };
+                next_summary_id += 1;
+                combines += 1;
+                max_pair_nodes = max_pair_nodes.max(pair_nodes);
+                max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+                attach_finalized_early_total += finalized;
+                attach_propagated_total += propagated;
+                outside_propagated_total += outside_propagated;
+                outside_structural_elided_total += outside_structural_elided;
+                current = parent;
+                level += 1;
+            } else {
+                slots[level] = Some(current);
+                break;
+            }
+        }
+        max_live_summaries =
+            max_live_summaries.max(slots.iter().filter(|slot| slot.is_some()).count());
+    }
+
+    let mut root_fallback: Option<DiskHierarchicalH2Summary<U16Key>> = None;
+    if final_children.is_none() {
+        let mut remaining: Vec<_> = slots.into_iter().flatten().collect();
+        if remaining.is_empty() {
+            bail!("hierarchical H2 stream received an empty volume");
+        }
+        remaining.sort_by_key(|summary| summary.z0);
+        if remaining.len() == 1 {
+            root_fallback = remaining.pop();
+        } else {
+            let mut left = remaining.remove(0);
+            while remaining.len() > 1 {
+                let right = remaining.remove(0);
+                let (
+                    parent,
+                    pair_nodes,
+                    pair_state_bytes,
+                    finalized,
+                    propagated,
+                    outside_propagated,
+                    outside_structural_elided,
+                ) = match tuning.h2_hier_cross_storage {
+                    H2HierCrossStorageStrategy::Disk => combine_disk_h2_summaries(
+                        left,
+                        right,
+                        background_connectivity,
+                        tuning.interface_order,
+                        temp_directory.path(),
+                        next_summary_id,
+                        &mut pair_writer,
+                        matches!(
+                            tuning.h2_hier_outside_structural_pruning,
+                            H2HierOutsideStructuralPruningStrategy::OutsideDominated
+                        ),
+                    )?,
+                    H2HierCrossStorageStrategy::Direct => combine_disk_h2_summaries_direct_cross(
+                        left,
+                        right,
+                        background_connectivity,
+                        tuning.interface_order,
+                        temp_directory.path(),
+                        next_summary_id,
+                        &mut pair_writer,
+                        matches!(
+                            tuning.h2_hier_outside_structural_pruning,
+                            H2HierOutsideStructuralPruningStrategy::OutsideDominated
+                        ),
+                    )?,
+                };
+                next_summary_id += 1;
+                combines += 1;
+                max_pair_nodes = max_pair_nodes.max(pair_nodes);
+                max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+                attach_finalized_early_total += finalized;
+                attach_propagated_total += propagated;
+                outside_propagated_total += outside_propagated;
+                outside_structural_elided_total += outside_structural_elided;
+                left = parent;
+            }
+            let right = remaining
+                .pop()
+                .expect("hierarchical H2 final child unexpectedly missing");
+            final_children = Some((left, right));
+        }
+    }
+
+    if let Some((left, right)) = final_children {
+        println!(
+            "Optimized hierarchical H2 terminal-free final fan-in: z={}..{} + z={}..{}",
+            left.z0, left.z1, right.z0, right.z1,
+        );
+        let (pair_nodes, pair_state_bytes) = match tuning.h2_hier_cross_storage {
+            H2HierCrossStorageStrategy::Disk => finalize_disk_h2_pair(
+                left,
+                right,
+                background_connectivity,
+                tuning.interface_order,
+                temp_directory.path(),
+                next_summary_id,
+                &mut pair_writer,
+            )?,
+            H2HierCrossStorageStrategy::Direct => finalize_disk_h2_pair_direct_cross(
+                left,
+                right,
+                background_connectivity,
+                tuning.interface_order,
+                &mut pair_writer,
+            )?,
+        };
+        combines += 1;
+        max_pair_nodes = max_pair_nodes.max(pair_nodes);
+        max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+    } else if let Some(root) = root_fallback {
+        let (pair_nodes, pair_state_bytes) = finalize_single_disk_h2_root(root, &mut pair_writer)?;
+        max_pair_nodes = max_pair_nodes.max(pair_nodes);
+        max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+    }
+
+    pair_writer.flush()?;
+    drop(pair_writer);
+    let finalized_pair_bytes = path_bytes(&pairs_path)?;
+    println!(
+        "PROFILE_U16_PERSIST_LEAF dimension=h2 key_bytes=4 plateau_zero_elision={} zero_persistence_pairs_elided={} union_attempts={} successful_unions={} scalar_order_seconds={:.6} local_sweep_seconds={:.6} root_dedup={} same_root_unions={} root_dedup_inputs={} root_dedup_unique={} root_dedup_skipped={} neighbor_root_check={} direct_parent_checks={} direct_parent_hits={} two_hop_parent_checks={} two_hop_parent_hits={} avoided_neighbor_find_calls={} neighbor_find_calls={} neighbor_find_parent_steps={} neighbor_find_zero_hop={} neighbor_find_one_hop={} neighbor_find_two_hop={} neighbor_find_gt_two_hop={} same_root_neighbor_find_zero_hop={} same_root_neighbor_find_one_hop={} same_root_neighbor_find_two_hop={} same_root_neighbor_find_gt_two_hop={}",
+        if plateau_zero_elision { "on" } else { "off" },
+        leaf_zero_persistence_pairs_elided,
+        leaf_union_attempts,
+        leaf_successful_unions,
+        leaf_scalar_order_seconds,
+        leaf_local_sweep_seconds,
+        if root_dedup { "on" } else { "off" },
+        leaf_same_root_unions,
+        leaf_root_dedup_inputs,
+        leaf_root_dedup_unique,
+        leaf_root_dedup_skipped,
+        tuning.neighbor_root_check.as_str(),
+        leaf_direct_parent_checks,
+        leaf_direct_parent_hits,
+        leaf_two_hop_parent_checks,
+        leaf_two_hop_parent_hits,
+        leaf_avoided_neighbor_find_calls,
+        leaf_neighbor_find_calls,
+        leaf_neighbor_find_parent_steps,
+        leaf_neighbor_find_zero_hop,
+        leaf_neighbor_find_one_hop,
+        leaf_neighbor_find_two_hop,
+        leaf_neighbor_find_gt_two_hop,
+        leaf_same_root_neighbor_find_zero_hop,
+        leaf_same_root_neighbor_find_one_hop,
+        leaf_same_root_neighbor_find_two_hop,
+        leaf_same_root_neighbor_find_gt_two_hop,
+    );
+
+    if tuning.sweep_diagnostics {
+        let boundary_voxels = leaf_total_voxels.saturating_sub(leaf_interior_fast_voxels);
+        println!(
+            "PROFILE_U16_H2_SWEEP_STRUCTURE total_voxels={} interior_fast_voxels={} boundary_voxels={} pruning_mask_calls={} active_state_checks={} active_neighbor_hits={} representative_visits={} pruning_cache_hits={} pruning_cache_misses={} component_mask_computations={} interface_rep_queries={} interface_rep_writes={} interface_forced_root_unions={} interface_interface_unions={} final_pairs={} attach_events={} outside_events={} interface_events={}",
+            leaf_total_voxels,
+            leaf_interior_fast_voxels,
+            boundary_voxels,
+            leaf_pruning_mask_calls,
+            leaf_active_state_checks,
+            leaf_active_neighbor_hits,
+            leaf_representative_visits,
+            leaf_pruning_cache_hits,
+            leaf_pruning_cache_misses,
+            leaf_component_mask_computations,
+            leaf_interface_rep_queries,
+            leaf_interface_rep_writes,
+            leaf_interface_forced_root_unions,
+            leaf_interface_interface_unions,
+            leaf_final_pairs_total,
+            leaf_attach_events_total,
+            leaf_outside_events_total,
+            leaf_interface_events_total,
+        );
+    }
+
+    let mut output = AtomicOutput::create(output_path)?;
+    writeln!(output, "birth,death")?;
+    let mut finite_intervals = 0u64;
+    let mut reader = BufReader::new(File::open(&pairs_path)?);
+    while let Some(pair) = read_finite_pair::<U16Key>(&mut reader)? {
+        if write_pair_csv(&mut output, pair)? {
+            finite_intervals += 1;
+        }
+    }
+    output.commit()?;
+
+    println!(
+        "PROFILE_H2_HIER_STREAM leaf_slabs={} combines={} max_live_summaries={} max_pair_nodes={} max_pair_state_bytes={} final_interface_nodes=0 finalized_pair_bytes={} root_attach_bytes=0 root_outside_bytes=0 root_interface_bytes=0 root_materialized=false disk_key_bytes=4 local_birth_storage=reuse-input local_event_storage=direct global_h2_birth_state=compact global_h2_uf_layout=packed leaf_attach_events={} leaf_outside_events={} attach_finalized_early={} attach_propagated={} outside_propagated={} outside_structural_elided={} attach_pruning=elder-dominated h2_hier_cross_storage={} h2_hier_outside_structural_pruning={}",
+        ranges.len(),
+        combines,
+        max_live_summaries,
+        max_pair_nodes,
+        max_pair_state_bytes,
+        finalized_pair_bytes,
+        leaf_attach_events_total,
+        leaf_outside_events_total,
+        attach_finalized_early_total,
+        attach_propagated_total,
+        outside_propagated_total,
+        outside_structural_elided_total,
+        tuning.h2_hier_cross_storage.as_str(),
+        tuning.h2_hier_outside_structural_pruning.as_str(),
+    );
+
+    temp_directory.close()?;
+    println!(
+        "Hierarchical scalar H2 streaming computation took {:.3} seconds",
+        start.elapsed().as_secs_f64()
+    );
+    Ok(ScalarH2PersistenceStats { finite_intervals })
+}
+
+fn compute_h2_persistence_scalar_hierarchical_stream_wide_zslabs(
+    volume: &ScalarTiffStackReader,
+    slab_depth: usize,
+    background_connectivity: Connectivity,
+    output_path: &Path,
+    tuning: ScalarStreamTuning,
+) -> Result<ScalarH2PersistenceStats> {
+    let start = Instant::now();
+    if !matches!(
+        tuning.local_h2_birth_state,
+        crate::scalar_stream_tuning::LocalH2BirthStateStrategy::Compact
+    ) {
+        bail!("h2-scalar-hierarchical-stream requires --local-h2-birth-state compact");
+    }
+    if !matches!(
+        tuning.global_h2_birth_state,
+        GlobalH2BirthStateStrategy::Compact
+    ) {
+        bail!("h2-scalar-hierarchical-stream requires --global-h2-birth-state compact");
+    }
+    if !matches!(
+        tuning.global_h2_uf_layout,
+        crate::scalar_stream_tuning::GlobalH2UnionFindLayoutStrategy::Packed
+    ) {
+        bail!("h2-scalar-hierarchical-stream requires --global-h2-uf-layout packed");
+    }
+
+    let temp_directory = TempRunDirectory::create("h2_scalar_hierarchical_stream_runs")?;
+    println!(
+        "Scalar hierarchical H2 streaming temporary directory: {:?}",
+        temp_directory.path()
+    );
+    let pairs_path = temp_directory.path().join("h2_hier_finalized_pairs.bin");
+    let mut pair_writer = BufWriter::new(File::create(&pairs_path)?);
+
+    let mut ranges = Vec::new();
+    let mut z0 = 0usize;
+    let mut slab_id = 0usize;
+    while z0 < volume.depth {
+        let z1 = z0.saturating_add(slab_depth).min(volume.depth);
+        ranges.push((slab_id, z0, z1));
+        slab_id += 1;
+        z0 = z1;
+    }
+    let face_size = volume
+        .width
+        .checked_mul(volume.height)
+        .expect("hierarchical H2 face size overflow");
+    let planned_pair_nodes = if ranges.len() > 1 {
+        face_size.saturating_mul(4)
+    } else if volume.depth == 1 {
+        face_size
+    } else {
+        face_size.saturating_mul(2)
+    };
+    let planned_pair_state_bytes = u64::try_from(planned_pair_nodes)
+        .expect("hierarchical H2 planned pair nodes exceed u64")
+        .saturating_mul(8);
+    println!(
+        "Scalar hierarchical H2 storage: pipeline=wide64-direct-{}-fanin-outside disk_key_bytes=8 pair_state_bytes_per_node=8 planned_max_pair_nodes={} planned_max_pair_state_bytes={}",
+        tuning.h2_hier_cross_storage.as_str(),
+        planned_pair_nodes,
+        planned_pair_state_bytes,
+    );
+    println!(
+        "PROFILE_CONFIG scalar_h2_hierarchical_stream f32_key_mode={} interface_order={} event_order={} neighbor_kernel={} representative_active_check={} union_kernel={} neighbor_root_check={} active_state={} interface_state={} uf_layout={} local_h2_birth_state={} global_h2_birth_state={} global_h2_uf_layout={} local_birth_storage=reuse-input local_event_storage=direct local_attach_pruning=elder-dominated hierarchy_attach_pruning=elder-dominated outside_state=distinguished h2_hier_cross_storage={} h2_hier_outside_structural_pruning={}",
+        tuning.f32_key_mode.as_str(),
+        tuning.interface_order.as_str(),
+        tuning.event_order.as_str(),
+        tuning.neighbor_kernel.as_str(),
+        tuning.representative_active_check.as_str(),
+        tuning.union_kernel.as_str(),
+        tuning.neighbor_root_check.as_str(),
+        tuning.active_state.as_str(),
+        tuning.interface_state.as_str(),
+        tuning.uf_layout.as_str(),
+        tuning.local_h2_birth_state.as_str(),
+        tuning.global_h2_birth_state.as_str(),
+        tuning.global_h2_uf_layout.as_str(),
+        tuning.h2_hier_cross_storage.as_str(),
+        tuning.h2_hier_outside_structural_pruning.as_str(),
+    );
+
+    let mut slots: Vec<Option<DiskHierarchicalH2Summary<ScalarKey>>> = Vec::new();
+    let mut next_summary_id = ranges.len();
+    let mut combines = 0usize;
+    let mut max_live_summaries = 0usize;
+    let mut max_pair_nodes = 0usize;
+    let mut max_pair_state_bytes = 0u64;
+    let mut attach_finalized_early_total = 0u64;
+    let mut attach_propagated_total = 0u64;
+    let mut outside_propagated_total = 0u64;
+    let mut outside_structural_elided_total = 0u64;
+    let mut leaf_attach_events_total = 0u64;
+    let mut leaf_outside_events_total = 0u64;
+    let mut final_children: Option<(
+        DiskHierarchicalH2Summary<ScalarKey>,
+        DiskHierarchicalH2Summary<ScalarKey>,
+    )> = None;
+
+    'leaf_loop: for &(leaf_id, leaf_z0, leaf_z1) in &ranges {
+        println!("Preparing optimized hierarchical H2 leaf {leaf_id}: z={leaf_z0}..{leaf_z1}");
+        let (mut current, _profile, _leaf_pairs, leaf_attach, leaf_outside) =
+            prepare_disk_h2_leaf_scalar(
+                volume,
+                leaf_id,
+                leaf_z0,
+                leaf_z1,
+                background_connectivity,
+                temp_directory.path(),
+                leaf_id,
+                &mut pair_writer,
+                tuning,
+            )?;
+        leaf_attach_events_total += leaf_attach;
+        leaf_outside_events_total += leaf_outside;
+        let mut level = 0usize;
+        loop {
+            if level == slots.len() {
+                slots.push(Some(current));
+                break;
+            }
+            if let Some(left) = slots[level].take() {
+                let covers_entire_volume = ranges.len() > 1
+                    && leaf_id + 1 == ranges.len()
+                    && left.z0 == 0
+                    && current.z1 == volume.depth;
+                if covers_entire_volume {
+                    final_children = Some((left, current));
+                    break 'leaf_loop;
+                }
+                println!(
+                    "Optimized hierarchical H2 fan-in level {level}: z={}..{} + z={}..{}",
+                    left.z0, left.z1, current.z0, current.z1,
+                );
+                let (
+                    parent,
+                    pair_nodes,
+                    pair_state_bytes,
+                    finalized,
+                    propagated,
+                    outside_propagated,
+                    outside_structural_elided,
+                ) = match tuning.h2_hier_cross_storage {
+                    H2HierCrossStorageStrategy::Disk => combine_disk_h2_summaries(
+                        left,
+                        current,
+                        background_connectivity,
+                        tuning.interface_order,
+                        temp_directory.path(),
+                        next_summary_id,
+                        &mut pair_writer,
+                        matches!(
+                            tuning.h2_hier_outside_structural_pruning,
+                            H2HierOutsideStructuralPruningStrategy::OutsideDominated
+                        ),
+                    )?,
+                    H2HierCrossStorageStrategy::Direct => combine_disk_h2_summaries_direct_cross(
+                        left,
+                        current,
+                        background_connectivity,
+                        tuning.interface_order,
+                        temp_directory.path(),
+                        next_summary_id,
+                        &mut pair_writer,
+                        matches!(
+                            tuning.h2_hier_outside_structural_pruning,
+                            H2HierOutsideStructuralPruningStrategy::OutsideDominated
+                        ),
+                    )?,
+                };
+                next_summary_id += 1;
+                combines += 1;
+                max_pair_nodes = max_pair_nodes.max(pair_nodes);
+                max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+                attach_finalized_early_total += finalized;
+                attach_propagated_total += propagated;
+                outside_propagated_total += outside_propagated;
+                outside_structural_elided_total += outside_structural_elided;
+                current = parent;
+                level += 1;
+            } else {
+                slots[level] = Some(current);
+                break;
+            }
+        }
+        max_live_summaries =
+            max_live_summaries.max(slots.iter().filter(|slot| slot.is_some()).count());
+    }
+
+    let mut root_fallback: Option<DiskHierarchicalH2Summary<ScalarKey>> = None;
+    if final_children.is_none() {
+        let mut remaining: Vec<_> = slots.into_iter().flatten().collect();
+        if remaining.is_empty() {
+            bail!("hierarchical H2 stream received an empty volume");
+        }
+        remaining.sort_by_key(|summary| summary.z0);
+        if remaining.len() == 1 {
+            root_fallback = remaining.pop();
+        } else {
+            let mut left = remaining.remove(0);
+            while remaining.len() > 1 {
+                let right = remaining.remove(0);
+                let (
+                    parent,
+                    pair_nodes,
+                    pair_state_bytes,
+                    finalized,
+                    propagated,
+                    outside_propagated,
+                    outside_structural_elided,
+                ) = match tuning.h2_hier_cross_storage {
+                    H2HierCrossStorageStrategy::Disk => combine_disk_h2_summaries(
+                        left,
+                        right,
+                        background_connectivity,
+                        tuning.interface_order,
+                        temp_directory.path(),
+                        next_summary_id,
+                        &mut pair_writer,
+                        matches!(
+                            tuning.h2_hier_outside_structural_pruning,
+                            H2HierOutsideStructuralPruningStrategy::OutsideDominated
+                        ),
+                    )?,
+                    H2HierCrossStorageStrategy::Direct => combine_disk_h2_summaries_direct_cross(
+                        left,
+                        right,
+                        background_connectivity,
+                        tuning.interface_order,
+                        temp_directory.path(),
+                        next_summary_id,
+                        &mut pair_writer,
+                        matches!(
+                            tuning.h2_hier_outside_structural_pruning,
+                            H2HierOutsideStructuralPruningStrategy::OutsideDominated
+                        ),
+                    )?,
+                };
+                next_summary_id += 1;
+                combines += 1;
+                max_pair_nodes = max_pair_nodes.max(pair_nodes);
+                max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+                attach_finalized_early_total += finalized;
+                attach_propagated_total += propagated;
+                outside_propagated_total += outside_propagated;
+                outside_structural_elided_total += outside_structural_elided;
+                left = parent;
+            }
+            let right = remaining
+                .pop()
+                .expect("hierarchical H2 final child unexpectedly missing");
+            final_children = Some((left, right));
+        }
+    }
+
+    if let Some((left, right)) = final_children {
+        println!(
+            "Optimized hierarchical H2 terminal-free final fan-in: z={}..{} + z={}..{}",
+            left.z0, left.z1, right.z0, right.z1,
+        );
+        let (pair_nodes, pair_state_bytes) = match tuning.h2_hier_cross_storage {
+            H2HierCrossStorageStrategy::Disk => finalize_disk_h2_pair(
+                left,
+                right,
+                background_connectivity,
+                tuning.interface_order,
+                temp_directory.path(),
+                next_summary_id,
+                &mut pair_writer,
+            )?,
+            H2HierCrossStorageStrategy::Direct => finalize_disk_h2_pair_direct_cross(
+                left,
+                right,
+                background_connectivity,
+                tuning.interface_order,
+                &mut pair_writer,
+            )?,
+        };
+        combines += 1;
+        max_pair_nodes = max_pair_nodes.max(pair_nodes);
+        max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+    } else if let Some(root) = root_fallback {
+        let (pair_nodes, pair_state_bytes) = finalize_single_disk_h2_root(root, &mut pair_writer)?;
+        max_pair_nodes = max_pair_nodes.max(pair_nodes);
+        max_pair_state_bytes = max_pair_state_bytes.max(pair_state_bytes);
+    }
+
+    pair_writer.flush()?;
+    drop(pair_writer);
+    let finalized_pair_bytes = path_bytes(&pairs_path)?;
+
+    let mut output = AtomicOutput::create(output_path)?;
+    writeln!(output, "birth,death")?;
+    let mut finite_intervals = 0u64;
+    let mut reader = BufReader::new(File::open(&pairs_path)?);
+    while let Some(pair) = read_finite_pair::<ScalarKey>(&mut reader)? {
+        if write_pair_csv(&mut output, pair)? {
+            finite_intervals += 1;
+        }
+    }
+    output.commit()?;
+
+    println!(
+        "PROFILE_H2_HIER_STREAM leaf_slabs={} combines={} max_live_summaries={} max_pair_nodes={} max_pair_state_bytes={} final_interface_nodes=0 finalized_pair_bytes={} root_attach_bytes=0 root_outside_bytes=0 root_interface_bytes=0 root_materialized=false disk_key_bytes=8 local_birth_storage=reuse-input local_event_storage=direct global_h2_birth_state=compact global_h2_uf_layout=packed leaf_attach_events={} leaf_outside_events={} attach_finalized_early={} attach_propagated={} outside_propagated={} outside_structural_elided={} attach_pruning=elder-dominated h2_hier_cross_storage={} h2_hier_outside_structural_pruning={}",
+        ranges.len(),
+        combines,
+        max_live_summaries,
+        max_pair_nodes,
+        max_pair_state_bytes,
+        finalized_pair_bytes,
+        leaf_attach_events_total,
+        leaf_outside_events_total,
+        attach_finalized_early_total,
+        attach_propagated_total,
+        outside_propagated_total,
+        outside_structural_elided_total,
+        tuning.h2_hier_cross_storage.as_str(),
+        tuning.h2_hier_outside_structural_pruning.as_str(),
+    );
+
+    temp_directory.close()?;
+    println!(
+        "Hierarchical scalar H2 streaming computation took {:.3} seconds",
+        start.elapsed().as_secs_f64()
+    );
+    Ok(ScalarH2PersistenceStats { finite_intervals })
+}
+
 pub fn compute_h2_persistence_scalar_hierarchical_stream_zslabs(
     volume: &ScalarTiffStackReader,
     slab_depth: usize,
@@ -3772,6 +4992,24 @@ pub fn compute_h2_persistence_scalar_hierarchical_stream_zslabs(
     tuning: ScalarStreamTuning,
 ) -> Result<ScalarH2PersistenceStats> {
     let start = Instant::now();
+    if volume.pixel_type == ScalarPixelType::U16 && u16_native_persistence_enabled() {
+        return compute_h2_persistence_scalar_hierarchical_stream_u16_zslabs(
+            volume,
+            slab_depth,
+            background_connectivity,
+            output_path,
+            tuning,
+        );
+    }
+    if volume.pixel_type != ScalarPixelType::F32 {
+        return compute_h2_persistence_scalar_hierarchical_stream_wide_zslabs(
+            volume,
+            slab_depth,
+            background_connectivity,
+            output_path,
+            tuning,
+        );
+    }
     if volume.pixel_type != ScalarPixelType::F32 || tuning.f32_key_mode != F32KeyMode::Native32 {
         bail!(
             "h2-scalar-hierarchical-stream currently requires an F32 TIFF stack with --f32-key-mode native32"

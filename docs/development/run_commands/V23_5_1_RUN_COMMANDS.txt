@@ -1,0 +1,25 @@
+# v23.5.1 focused confirmation of the U16 H2 fast interface query
+
+cd ~/Desktop
+rm -rf stream_betti_curves_persistence_v23_5_1
+mkdir stream_betti_curves_persistence_v23_5_1
+
+unzip \
+  ~/Downloads/stream_betti_curves_u16_h2_fast_interface_query_v23_5_1_confirmation.zip \
+  -d stream_betti_curves_persistence_v23_5_1
+
+cd stream_betti_curves_persistence_v23_5_1
+
+./scripts/prepare_for_commit.sh
+
+./scripts/confirm_u16_h2_fast_interface_query_v23_5_1.sh \
+  ~/Desktop/stream_betti_curves_git/examples/CX09T1 \
+  profiles/v23_5_1_u16_h2_fast_interface_query_d16_confirmation.csv
+
+zip -j \
+  ~/Desktop/v23_5_1_u16_h2_fast_interface_query_confirmation_results.zip \
+  profiles/v23_5_1_u16_h2_fast_interface_query_d16_confirmation.csv \
+  profiles/v23_5_1_u16_h2_fast_interface_query_d16_confirmation_summary.csv \
+  profiles/v23_5_1_u16_h2_fast_interface_query_d16_confirmation_pairs.csv \
+  profiles/v23_5_1_u16_h2_fast_interface_query_d16_confirmation_paired_summary.csv \
+  profiles/v23_5_1_u16_h2_fast_interface_query_d16_confirmation_decision.txt

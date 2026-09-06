@@ -1,0 +1,36 @@
+cd ~/Desktop
+rm -rf stream_betti_curves_persistence_v23_2
+mkdir stream_betti_curves_persistence_v23_2
+
+unzip \
+  ~/Downloads/stream_betti_curves_u16_h2_two_hop_parent_shortcut_v23_2_experimental.zip \
+  -d stream_betti_curves_persistence_v23_2
+
+cd stream_betti_curves_persistence_v23_2
+
+./scripts/prepare_for_commit.sh
+
+python3 validation/check_u16_h2_two_hop_parent_shortcut_equivalence.py \
+  ~/Desktop/stream_betti_curves_git/examples/CX09T1 \
+  --binary target/release/betti_curves \
+  --slab-depths 16 32 64 \
+  --foreground-connectivity 26
+
+mkdir -p profiles
+
+python3 scripts/profile_u16_h2_two_hop_parent_shortcut.py \
+  ~/Desktop/stream_betti_curves_git/examples/CX09T1 \
+  --binary target/release/betti_curves \
+  --slab-depths 16 32 64 \
+  --foreground-connectivity 26 \
+  --warmup 1 \
+  --repeats 11 \
+  --start-with reference \
+  --output profiles/v23_2_u16_h2_two_hop_parent_shortcut_paired.csv
+
+zip -j \
+  ~/Desktop/v23_2_u16_h2_two_hop_parent_shortcut_results.zip \
+  profiles/v23_2_u16_h2_two_hop_parent_shortcut_paired.csv \
+  profiles/v23_2_u16_h2_two_hop_parent_shortcut_paired_summary.csv \
+  profiles/v23_2_u16_h2_two_hop_parent_shortcut_paired_pairs.csv \
+  profiles/v23_2_u16_h2_two_hop_parent_shortcut_paired_paired_summary.csv

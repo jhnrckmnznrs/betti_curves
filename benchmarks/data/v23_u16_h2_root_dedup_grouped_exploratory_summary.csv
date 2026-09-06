@@ -1,0 +1,5 @@
+backend,slab_depth,repeats,median_wall_seconds,median_max_rss_mib,median_user_seconds,median_system_seconds,median_zero_persistence_pairs_elided,median_union_attempts,median_successful_unions,median_same_root_unions,median_root_dedup_inputs,median_root_dedup_unique,median_root_dedup_skipped,median_scalar_order_seconds,median_local_sweep_seconds
+off,16,5,3.543786762995296,20.49609375,3.2,0.32,28809223.0,98554512.0,33634020.0,64920492.0,0.0,0.0,0.0,0.17989,2.704387
+off,32,5,4.529140041995561,33.42578125,4.19,0.28,30866440.0,99605576.0,33634034.0,65971542.0,0.0,0.0,0.0,0.195674,3.902939
+on,16,5,3.5215135850012302,20.4921875,3.21,0.29,28809223.0,33634020.0,33634020.0,0.0,98554512.0,33634020.0,64920492.0,0.176817,2.70239
+on,32,5,3.82935006498883,33.51171875,3.55,0.26,30866440.0,33634034.0,33634034.0,0.0,99605576.0,33634034.0,65971542.0,0.183279,3.298934

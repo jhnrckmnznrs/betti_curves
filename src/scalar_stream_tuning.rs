@@ -170,6 +170,8 @@ impl UnionKernelStrategy {
 pub(crate) enum NeighborRootCheckStrategy {
     Find,
     ParentShortcut,
+    ParentTwoHop,
+    ParentCachedFind,
 }
 
 impl NeighborRootCheckStrategy {
@@ -177,7 +179,11 @@ impl NeighborRootCheckStrategy {
         match value {
             "find" => Ok(Self::Find),
             "parent-shortcut" => Ok(Self::ParentShortcut),
-            _ => bail!("invalid --neighbor-root-check {value:?}; expected find or parent-shortcut"),
+            "parent-two-hop" => Ok(Self::ParentTwoHop),
+            "parent-cached-find" => Ok(Self::ParentCachedFind),
+            _ => bail!(
+                "invalid --neighbor-root-check {value:?}; expected find, parent-shortcut, parent-two-hop, or parent-cached-find"
+            ),
         }
     }
 
@@ -185,6 +191,8 @@ impl NeighborRootCheckStrategy {
         match self {
             Self::Find => "find",
             Self::ParentShortcut => "parent-shortcut",
+            Self::ParentTwoHop => "parent-two-hop",
+            Self::ParentCachedFind => "parent-cached-find",
         }
     }
 }
@@ -726,6 +734,14 @@ mod tests {
         assert_eq!(
             NeighborRootCheckStrategy::parse("parent-shortcut").unwrap(),
             NeighborRootCheckStrategy::ParentShortcut
+        );
+        assert_eq!(
+            NeighborRootCheckStrategy::parse("parent-two-hop").unwrap(),
+            NeighborRootCheckStrategy::ParentTwoHop
+        );
+        assert_eq!(
+            NeighborRootCheckStrategy::parse("parent-cached-find").unwrap(),
+            NeighborRootCheckStrategy::ParentCachedFind
         );
         assert_eq!(
             H0PruningCacheStrategy::parse("off").unwrap(),

@@ -8,7 +8,7 @@
 //! sorting.
 
 use crate::io_scalar::ScalarPixelType;
-use crate::scalar::{F32Key, ScalarKey};
+use crate::scalar::{F32Key, ScalarKey, U16Key};
 
 pub(crate) trait RadixScalarKey: Copy + Ord {
     const RADIX_BYTES: usize;
@@ -21,6 +21,15 @@ impl RadixScalarKey for ScalarKey {
     #[inline]
     fn raw_u64(self) -> u64 {
         self.raw()
+    }
+}
+
+impl RadixScalarKey for U16Key {
+    const RADIX_BYTES: usize = 4;
+
+    #[inline]
+    fn raw_u64(self) -> u64 {
+        u64::from(self.raw())
     }
 }
 
@@ -44,6 +53,36 @@ pub(crate) fn sorted_scalar_indices(values: &[ScalarKey], pixel_type: ScalarPixe
         ScalarPixelType::U16 => counting_order(values, 65_536),
         ScalarPixelType::F32 | ScalarPixelType::F64 => radix_order(values),
     }
+}
+
+/// Exact stable value-then-index order for compact U16 keys.
+pub(crate) fn sorted_u16_indices(values: &[U16Key]) -> Vec<u32> {
+    assert!(
+        values.len() <= u32::MAX as usize,
+        "U16 slab has too many voxels for u32 indices"
+    );
+    let mut counts = vec![0usize; 65_536];
+    for &value in values {
+        let bucket = value.raw() as usize;
+        debug_assert!(bucket < 65_536);
+        counts[bucket] += 1;
+    }
+
+    let mut offsets = vec![0usize; 65_536];
+    let mut next = 0usize;
+    for (bucket, count) in counts.into_iter().enumerate() {
+        offsets[bucket] = next;
+        next += count;
+    }
+
+    let mut order = vec![0u32; values.len()];
+    for (index, &value) in values.iter().enumerate() {
+        let bucket = value.raw() as usize;
+        let position = offsets[bucket];
+        order[position] = index as u32;
+        offsets[bucket] += 1;
+    }
+    order
 }
 
 /// Exact stable value-then-index order for native-width F32 keys.
@@ -197,6 +236,17 @@ mod tests {
             sorted_scalar_indices(&values, ScalarPixelType::F64),
             comparison_order(&values)
         );
+    }
+
+    #[test]
+    fn native_u16_counting_order_matches_comparison_order() {
+        let values: Vec<_> = [65_535u16, 1, 9_000, 1, 0, 42, 42]
+            .into_iter()
+            .map(U16Key::from_u16)
+            .collect();
+        let mut expected: Vec<u32> = (0..values.len() as u32).collect();
+        expected.sort_unstable_by_key(|&index| (values[index as usize], index));
+        assert_eq!(sorted_u16_indices(&values), expected);
     }
 
     #[test]

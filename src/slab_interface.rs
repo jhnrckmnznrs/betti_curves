@@ -33,6 +33,29 @@ pub(crate) fn local_boundary_node_id(
     }
 }
 
+/// Fast root-invariant interface lookup from a local slab-linear voxel index.
+///
+/// This is equivalent to first computing `(z, face_index)` via division and
+/// remainder and then calling `local_boundary_node_id`, but it uses only range
+/// comparisons and subtraction on the hot path.
+pub(crate) fn local_boundary_node_id_from_linear_index(
+    index: usize,
+    face_size: usize,
+    upper_face_start: usize,
+) -> Option<u32> {
+    if index < face_size {
+        return Some(u32::try_from(index).expect("face index exceeds u32"));
+    }
+    if index >= upper_face_start {
+        let face_index = index - upper_face_start;
+        debug_assert!(face_index < face_size);
+        return Some(
+            u32::try_from(face_size + face_index).expect("upper-face interface index exceeds u32"),
+        );
+    }
+    None
+}
+
 pub(crate) fn face_node_id(z: usize, depth: usize, face_index: usize, face_size: usize) -> u32 {
     local_boundary_node_id(z, depth, face_index, face_size)
         .expect("requested slice is not a slab boundary face")
@@ -41,6 +64,27 @@ pub(crate) fn face_node_id(z: usize, depth: usize, face_index: usize, face_size:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linear_index_fast_lookup_matches_division_reference() {
+        for depth in 1usize..=9 {
+            for face_size in [1usize, 2, 7, 31, 257] {
+                for index in 0..depth * face_size {
+                    let z = index / face_size;
+                    let face_index = index % face_size;
+                    assert_eq!(
+                        local_boundary_node_id_from_linear_index(
+                            index,
+                            face_size,
+                            (depth - 1) * face_size
+                        ),
+                        local_boundary_node_id(z, depth, face_index, face_size),
+                        "depth={depth} face_size={face_size} index={index}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn one_slice_faces_share_ids() {
