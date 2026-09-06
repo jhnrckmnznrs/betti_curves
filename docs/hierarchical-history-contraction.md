@@ -86,3 +86,40 @@ The optimization changes only how already-final finalized history is stored
 and how stale parent IDs in that history are repaired before root replay.
 Exact flat-vs-hierarchical plateau-canonical equivalence remains the required
 end-to-end oracle.
+
+## Leaf-local contraction (v11 candidate)
+
+The same invariant can be applied one level earlier, while a leaf slab is
+being swept. Local branch IDs are globally unique to that slab, and no earlier
+leaf can have emitted a finalized record whose parent names a branch that has
+not yet been born. Therefore a leaf can run the same online contraction on its
+own finalized history before returning its summary.
+
+The leaf-local contractor retains only positive-persistence local deaths. When
+a zero-persistence local branch becomes final, it repairs any already-retained
+positive local event that still names that branch as a provisional parent and
+then discards the diagonal death immediately. The central hierarchical
+contractor subsequently receives only the retained positive leaf history plus
+finalized transitions produced by higher fan-in levels.
+
+This is a staging transformation, not a change in branch semantics:
+
+\[
+  C(\text{leaf}_1 \Vert \cdots \Vert \text{leaf}_m \Vert H)
+  =
+  C(C(\text{leaf}_1) \Vert \cdots \Vert C(\text{leaf}_m) \Vert H),
+\]
+
+where \(C\) is the filtration-aware finalized-history contraction and \(H\)
+is the higher-level history, under the disjoint-leaf/no-future-reference
+invariant above.
+
+The candidate can be disabled for an exact same-binary v10 reference:
+
+```bash
+BETTI_HIER_INLINE_LEAF_HISTORY=0
+```
+
+Profiling reports raw leaf-local history, retained leaf history, locally
+contracted zero events, locally repaired parent references, and the number of
+events that still reach the central finalized-history contractor.

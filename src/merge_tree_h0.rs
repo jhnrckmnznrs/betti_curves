@@ -81,9 +81,123 @@ fn build_voxel_buckets_u16(values: &[u16]) -> VoxelBuckets {
 
 #[derive(Debug, Clone, Copy)]
 enum LocalAction {
+    None,
     LocalMerge(H0BranchMerge),
     Attach(AttachEvent),
     InterfaceMerge(InterfaceMergeEvent),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct H0LeafAttachStats {
+    pub(crate) one_boundary_internal: u64,
+    pub(crate) finalized_early: u64,
+    pub(crate) propagated_attach: u64,
+    pub(crate) local_history_input_events: u64,
+    pub(crate) local_history_retained_events: u64,
+    pub(crate) local_history_contracted_zero_events: u64,
+    pub(crate) local_history_repaired_parent_refs: u64,
+}
+
+/// Leaf-local counterpart of the hierarchical finalized-history contractor.
+///
+/// In reference mode this is just a Vec sink. In inline mode it contracts
+/// zero-persistence deaths immediately and repairs already-retained positive
+/// events whose provisional parent dies later inside the same leaf. Branches
+/// born in this leaf cannot have been referenced by an earlier leaf, so this
+/// transformation is equivalent to sending the raw leaf history to the
+/// central contractor, but avoids materializing the diagonal history first.
+#[derive(Debug)]
+struct LocalMergeHistory {
+    events: Vec<H0BranchMerge>,
+    by_parent: HashMap<u64, Vec<usize>>,
+    inline_contract: bool,
+    input_events: u64,
+    contracted_zero_events: u64,
+    repaired_parent_refs: u64,
+}
+
+impl LocalMergeHistory {
+    fn new(inline_contract: bool) -> Self {
+        Self {
+            events: Vec::new(),
+            by_parent: HashMap::new(),
+            inline_contract,
+            input_events: 0,
+            contracted_zero_events: 0,
+            repaired_parent_refs: 0,
+        }
+    }
+
+    fn push(&mut self, merge: H0BranchMerge) {
+        self.input_events += 1;
+        if !self.inline_contract {
+            self.events.push(merge);
+            return;
+        }
+
+        let zero = merge.child.birth == merge.value;
+        self.redirect_existing(
+            merge.child.id,
+            merge.parent.id,
+            merge.parent.birth,
+            merge.value,
+            zero,
+        );
+        if zero {
+            self.contracted_zero_events += 1;
+            return;
+        }
+
+        let index = self.events.len();
+        self.events.push(merge);
+        self.by_parent
+            .entry(merge.parent.id)
+            .or_default()
+            .push(index);
+    }
+
+    fn redirect_existing(
+        &mut self,
+        child_id: u64,
+        parent_id: u64,
+        parent_birth: u16,
+        death: u16,
+        zero: bool,
+    ) {
+        let Some(indices) = self.by_parent.remove(&child_id) else {
+            return;
+        };
+        let mut keep = Vec::new();
+        let mut moved = Vec::new();
+        for index in indices {
+            let event = &mut self.events[index];
+            if zero || event.value > death {
+                debug_assert_eq!(event.parent.id, child_id);
+                event.parent = H0Branch {
+                    id: parent_id,
+                    birth: parent_birth,
+                };
+                self.repaired_parent_refs += 1;
+                moved.push(index);
+            } else {
+                keep.push(index);
+            }
+        }
+        if !keep.is_empty() {
+            self.by_parent.insert(child_id, keep);
+        }
+        if !moved.is_empty() {
+            self.by_parent.entry(parent_id).or_default().extend(moved);
+        }
+    }
+
+    fn retained_events(&self) -> u64 {
+        self.events.len() as u64
+    }
+
+    fn into_events(self) -> Vec<H0BranchMerge> {
+        self.events
+    }
 }
 
 #[derive(Debug)]
@@ -141,7 +255,14 @@ impl LocalUnionFind {
         self.interface_rep[root as usize] = interface_node;
     }
 
-    fn union(&mut self, a: u32, b: u32, value: u16) -> Option<LocalAction> {
+    fn union(
+        &mut self,
+        a: u32,
+        b: u32,
+        value: u16,
+        finalize_nonpromoting_attach: bool,
+        attach_stats: &mut H0LeafAttachStats,
+    ) -> Option<LocalAction> {
         let mut root_a = self.find(a);
         let mut root_b = self.find(b);
         if root_a == root_b {
@@ -156,21 +277,61 @@ impl LocalUnionFind {
         let rep_b = self.interface_rep[root_b as usize];
 
         let action = match (rep_a != NO_INTERFACE_REP, rep_b != NO_INTERFACE_REP) {
-            (false, false) => LocalAction::LocalMerge(H0BranchMerge {
-                value,
-                child: younger,
-                parent: older,
-            }),
-            (true, false) => LocalAction::Attach(AttachEvent {
-                value,
-                interface_node: rep_a,
-                branch: branch_b,
-            }),
-            (false, true) => LocalAction::Attach(AttachEvent {
-                value,
-                interface_node: rep_b,
-                branch: branch_a,
-            }),
+            (false, false) => {
+                if branch_a == branch_b {
+                    LocalAction::None
+                } else {
+                    LocalAction::LocalMerge(H0BranchMerge {
+                        value,
+                        child: younger,
+                        parent: older,
+                    })
+                }
+            }
+            (true, false) => {
+                attach_stats.one_boundary_internal += 1;
+                if finalize_nonpromoting_attach && older == branch_a {
+                    attach_stats.finalized_early += 1;
+                    if branch_a == branch_b {
+                        LocalAction::None
+                    } else {
+                        LocalAction::LocalMerge(H0BranchMerge {
+                            value,
+                            child: branch_b,
+                            parent: branch_a,
+                        })
+                    }
+                } else {
+                    attach_stats.propagated_attach += 1;
+                    LocalAction::Attach(AttachEvent {
+                        value,
+                        interface_node: rep_a,
+                        branch: branch_b,
+                    })
+                }
+            }
+            (false, true) => {
+                attach_stats.one_boundary_internal += 1;
+                if finalize_nonpromoting_attach && older == branch_b {
+                    attach_stats.finalized_early += 1;
+                    if branch_a == branch_b {
+                        LocalAction::None
+                    } else {
+                        LocalAction::LocalMerge(H0BranchMerge {
+                            value,
+                            child: branch_a,
+                            parent: branch_b,
+                        })
+                    }
+                } else {
+                    attach_stats.propagated_attach += 1;
+                    LocalAction::Attach(AttachEvent {
+                        value,
+                        interface_node: rep_b,
+                        branch: branch_a,
+                    })
+                }
+            }
             (true, true) => LocalAction::InterfaceMerge(InterfaceMergeEvent {
                 value,
                 a: rep_a,
@@ -200,14 +361,17 @@ impl LocalUnionFind {
 }
 
 struct LocalBuffers<'a> {
-    local_merge_events: &'a mut Vec<H0BranchMerge>,
+    local_merge_history: &'a mut LocalMergeHistory,
     attach_events: &'a mut Vec<AttachEvent>,
     interface_merge_events: &'a mut Vec<InterfaceMergeEvent>,
+    finalize_nonpromoting_attach: bool,
+    attach_stats: &'a mut H0LeafAttachStats,
 }
 
 fn handle_action(action: LocalAction, buffers: &mut LocalBuffers<'_>) {
     match action {
-        LocalAction::LocalMerge(event) => buffers.local_merge_events.push(event),
+        LocalAction::None => {}
+        LocalAction::LocalMerge(event) => buffers.local_merge_history.push(event),
         LocalAction::Attach(event) => buffers.attach_events.push(event),
         LocalAction::InterfaceMerge(event) => buffers.interface_merge_events.push(event),
     }
@@ -224,7 +388,13 @@ fn union_active_neighbor(
     if active[neighbor] == 0 {
         return;
     }
-    if let Some(action) = uf.union(current, neighbor as u32, value) {
+    if let Some(action) = uf.union(
+        current,
+        neighbor as u32,
+        value,
+        buffers.finalize_nonpromoting_attach,
+        &mut *buffers.attach_stats,
+    ) {
         handle_action(action, buffers);
     }
 }
@@ -234,6 +404,32 @@ pub(crate) fn process_slab_h0_merge_tree(
     block: &Block,
     connectivity: Connectivity,
 ) -> SlabH0MergeTreeSummary {
+    process_slab_h0_merge_tree_impl(slab_id, block, connectivity, false, false).0
+}
+
+pub(crate) fn process_slab_h0_merge_tree_hierarchical(
+    slab_id: usize,
+    block: &Block,
+    connectivity: Connectivity,
+    finalize_nonpromoting_attach: bool,
+    inline_contract_local_history: bool,
+) -> (SlabH0MergeTreeSummary, H0LeafAttachStats) {
+    process_slab_h0_merge_tree_impl(
+        slab_id,
+        block,
+        connectivity,
+        finalize_nonpromoting_attach,
+        inline_contract_local_history,
+    )
+}
+
+fn process_slab_h0_merge_tree_impl(
+    slab_id: usize,
+    block: &Block,
+    connectivity: Connectivity,
+    finalize_nonpromoting_attach: bool,
+    inline_contract_local_history: bool,
+) -> (SlabH0MergeTreeSummary, H0LeafAttachStats) {
     let voxel_count = block.voxel_count();
     let width = block.shape[0];
     let height = block.shape[1];
@@ -248,9 +444,10 @@ pub(crate) fn process_slab_h0_merge_tree(
     let interface_node_count = u32::try_from(slab_interface_node_count(slice_size, depth))
         .expect("slab interface node count exceeds u32");
 
-    let mut local_merge_events = Vec::new();
+    let mut local_merge_history = LocalMergeHistory::new(inline_contract_local_history);
     let mut attach_events = Vec::new();
     let mut interface_merge_events = Vec::new();
+    let mut attach_stats = H0LeafAttachStats::default();
 
     for value in 0..NUM_U16_VALUES {
         let start = buckets.offsets[value];
@@ -274,9 +471,11 @@ pub(crate) fn process_slab_h0_merge_tree(
             let x = idx % width;
             let y = (idx / width) % height;
             let mut buffers = LocalBuffers {
-                local_merge_events: &mut local_merge_events,
+                local_merge_history: &mut local_merge_history,
                 attach_events: &mut attach_events,
                 interface_merge_events: &mut interface_merge_events,
+                finalize_nonpromoting_attach,
+                attach_stats: &mut attach_stats,
             };
 
             local_pruner.for_each_representative_neighbor(
@@ -301,18 +500,27 @@ pub(crate) fn process_slab_h0_merge_tree(
         }
     }
 
+    attach_stats.local_history_input_events = local_merge_history.input_events;
+    attach_stats.local_history_retained_events = local_merge_history.retained_events();
+    attach_stats.local_history_contracted_zero_events = local_merge_history.contracted_zero_events;
+    attach_stats.local_history_repaired_parent_refs = local_merge_history.repaired_parent_refs;
+    let local_merge_events = local_merge_history.into_events();
+
     let z_min_face = extract_boundary_face_nodes(block, 0);
     let z_max_face = extract_boundary_face_nodes(block, depth - 1);
 
-    SlabH0MergeTreeSummary {
-        slab_id,
-        local_merge_events,
-        attach_events,
-        interface_merge_events,
-        interface_node_count,
-        z_min_face,
-        z_max_face,
-    }
+    (
+        SlabH0MergeTreeSummary {
+            slab_id,
+            local_merge_events,
+            attach_events,
+            interface_merge_events,
+            interface_node_count,
+            z_min_face,
+            z_max_face,
+        },
+        attach_stats,
+    )
 }
 
 fn extract_boundary_face_nodes(block: &Block, z_local: usize) -> BoundaryFaceNodes {
@@ -655,13 +863,6 @@ pub(crate) fn reduce_merge_tree(
     connectivity: Connectivity,
 ) -> Result<MergeTree> {
     reduce_merge_tree_impl(summaries, connectivity, false, None)
-}
-
-pub(crate) fn reduce_merge_tree_with_deferred_parent_repair(
-    summaries: &[SlabH0MergeTreeSummary],
-    connectivity: Connectivity,
-) -> Result<MergeTree> {
-    reduce_merge_tree_impl(summaries, connectivity, true, None)
 }
 
 pub(crate) fn reduce_merge_tree_with_deferred_parent_repair_prebucketed(
@@ -1012,5 +1213,128 @@ mod deferred_parent_tests {
         });
 
         assert_eq!(resolver.resolve(first_parent), survivor);
+    }
+}
+
+#[cfg(test)]
+mod hierarchical_leaf_attach_pruning_tests {
+    use super::*;
+
+    fn two_node_uf(boundary: H0Branch, internal: H0Branch) -> LocalUnionFind {
+        LocalUnionFind {
+            parent: vec![0, 1],
+            rank: vec![0, 0],
+            branch: vec![boundary, internal],
+            interface_rep: vec![0, NO_INTERFACE_REP],
+        }
+    }
+
+    #[test]
+    fn hierarchical_h0_finalizes_nonpromoting_internal_branch_early() {
+        let boundary = H0Branch { id: 1, birth: 1 };
+        let internal = H0Branch { id: 2, birth: 3 };
+        let mut uf = two_node_uf(boundary, internal);
+        let mut stats = H0LeafAttachStats::default();
+
+        let action = uf.union(0, 1, 5, true, &mut stats).unwrap();
+        match action {
+            LocalAction::LocalMerge(merge) => {
+                assert_eq!(merge.value, 5);
+                assert_eq!(merge.child, internal);
+                assert_eq!(merge.parent, boundary);
+            }
+            other => panic!("expected early local finalization, got {other:?}"),
+        }
+        assert_eq!(stats.one_boundary_internal, 1);
+        assert_eq!(stats.finalized_early, 1);
+        assert_eq!(stats.propagated_attach, 0);
+    }
+
+    #[test]
+    fn hierarchical_h0_keeps_promoting_internal_branch_as_attach() {
+        let boundary = H0Branch { id: 1, birth: 3 };
+        let internal = H0Branch { id: 2, birth: 1 };
+        let mut uf = two_node_uf(boundary, internal);
+        let mut stats = H0LeafAttachStats::default();
+
+        let action = uf.union(0, 1, 5, true, &mut stats).unwrap();
+        match action {
+            LocalAction::Attach(event) => {
+                assert_eq!(event.value, 5);
+                assert_eq!(event.interface_node, 0);
+                assert_eq!(event.branch, internal);
+            }
+            other => panic!("expected propagated attach, got {other:?}"),
+        }
+        assert_eq!(stats.finalized_early, 0);
+        assert_eq!(stats.propagated_attach, 1);
+    }
+
+    #[test]
+    fn h0_reference_leaf_policy_preserves_original_attach() {
+        let boundary = H0Branch { id: 1, birth: 1 };
+        let internal = H0Branch { id: 2, birth: 3 };
+        let mut uf = two_node_uf(boundary, internal);
+        let mut stats = H0LeafAttachStats::default();
+
+        assert!(matches!(
+            uf.union(0, 1, 5, false, &mut stats),
+            Some(LocalAction::Attach(_))
+        ));
+        assert_eq!(stats.finalized_early, 0);
+        assert_eq!(stats.propagated_attach, 1);
+    }
+
+    #[test]
+    fn h0_inline_leaf_history_contracts_diagonal_parent() {
+        let mut history = LocalMergeHistory::new(true);
+        history.push(H0BranchMerge {
+            value: 20,
+            child: H0Branch { id: 10, birth: 18 },
+            parent: H0Branch { id: 50, birth: 15 },
+        });
+        history.push(H0BranchMerge {
+            value: 15,
+            child: H0Branch { id: 50, birth: 15 },
+            parent: H0Branch { id: 60, birth: 10 },
+        });
+
+        assert_eq!(history.input_events, 2);
+        assert_eq!(history.contracted_zero_events, 1);
+        assert_eq!(history.repaired_parent_refs, 1);
+        assert_eq!(history.retained_events(), 1);
+        assert_eq!(history.events[0].parent.id, 60);
+        assert_eq!(history.events[0].parent.birth, 10);
+    }
+
+    #[test]
+    fn h0_inline_leaf_history_keeps_equal_threshold_positive_parent() {
+        let mut history = LocalMergeHistory::new(true);
+        history.push(H0BranchMerge {
+            value: 15,
+            child: H0Branch { id: 10, birth: 14 },
+            parent: H0Branch { id: 50, birth: 10 },
+        });
+        history.push(H0BranchMerge {
+            value: 15,
+            child: H0Branch { id: 50, birth: 10 },
+            parent: H0Branch { id: 60, birth: 5 },
+        });
+        assert_eq!(history.repaired_parent_refs, 0);
+        assert_eq!(history.events[0].parent.id, 50);
+        assert_eq!(history.retained_events(), 2);
+    }
+
+    #[test]
+    fn h0_reference_leaf_history_keeps_diagonal_event() {
+        let mut history = LocalMergeHistory::new(false);
+        history.push(H0BranchMerge {
+            value: 15,
+            child: H0Branch { id: 50, birth: 15 },
+            parent: H0Branch { id: 60, birth: 10 },
+        });
+        assert_eq!(history.input_events, 1);
+        assert_eq!(history.contracted_zero_events, 0);
+        assert_eq!(history.retained_events(), 1);
     }
 }

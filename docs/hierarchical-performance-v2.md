@@ -166,3 +166,34 @@ Per-combine profiling keeps `sort_seconds=0` for backward compatibility and
 adds `merge_seconds`. The external profiling script reports
 `median_combine_merge_seconds` so v7 can be compared directly with v6's
 sorting cost.
+
+## F. Streaming ordered fan-in (v2.6 experimental)
+
+After finalized-history contraction made root replay negligible, the remaining
+hierarchical cost was split between leaf processing and pairwise fan-in.  The
+ordered fan-in implementation still built a complete merged `Vec<Event>` at
+each combine before replaying that vector into the pair union-find.
+
+The v2.6 experimental path fuses those two passes.  A small cursor object peeks
+at the heads of the already ordered child/cross streams, selects the next event
+under the same deterministic key as v2.4, and yields it directly to the pair
+union-find.  No merged event vector is allocated in the default path.
+
+Ordering is unchanged:
+
+- H0: ascending value, Attach, Interface, Cross, with left before right.
+- H2: descending value, Outside, finite Attach, Interface, Cross, with left
+  before right.  H2 uses filtered attach cursors rather than materialized
+  index lists, so mixed Outside/finite attach summaries remain streaming.
+
+For controlled A/B validation, setting
+`BETTI_HIER_MATERIALIZE_FANIN=1` collects the exact same ordered cursor into a
+vector before replay.  This reference mode is intentionally retained so a
+single binary can compare materialized and streaming fan-in while keeping all
+other hierarchy/history-contraction code identical.
+
+Per-combine profiling reports `fanin_mode`, `streamed_events`, and
+`materialized_events`.  In streaming mode `merge_seconds=0` because ordering
+selection and union-find replay are fused and timed together in
+`reduce_seconds`; compare `total_seconds`, aggregate fan-in time, and peak RSS
+against v2.5/v8 rather than interpreting `reduce_seconds` in isolation.
