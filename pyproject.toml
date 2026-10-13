@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "betti-curves-py"
+version = "0.15.0"
+description = "Exact H0/H2 persistence and streaming Euler/H1 Betti curves for 3-D grayscale images"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26,<3", "tifffile>=2024.1.1"]
+
+[project.optional-dependencies]
+fast = ["numba>=0.59"]
+stream = ["scipy>=1.11"]
+test = ["pytest>=8", "scipy>=1.11", "scikit-image>=0.21"]
+
+[project.scripts]
+betti-curves-py = "betti_curves_py.cli:main"
+betti-euler-py = "betti_curves_py.euler_stream:main"
+
+[tool.setuptools.packages.find]
+include = ["betti_curves_py*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
