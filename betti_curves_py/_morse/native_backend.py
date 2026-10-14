@@ -19,7 +19,7 @@ import numpy as np
 from ._csr import prepare_complex
 
 class _Stats(ctypes.Structure):
-    _fields_=[(key,ctypes.c_uint64) for key in ('remaining','pairs','operations','trace_bytes','nonfree','tile_pairs','hit_budget','adaptive_stopped','adaptive_windows')]
+    _fields_=[(key,ctypes.c_uint64) for key in ('remaining','pairs','operations','trace_bytes','nonfree','tile_pairs','hit_budget','adaptive_stopped','adaptive_windows','critical_faces','critical_face_incidences')]
 
 _build_lock=threading.Lock()
 
@@ -45,7 +45,8 @@ def build_native(*,cache_dir=None):
                  ctypes.POINTER(ctypes.c_uint64),ctypes.POINTER(ctypes.c_uint32),ctypes.c_uint64,
                  ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,
                  ctypes.c_uint64,ctypes.c_uint64,ctypes.c_uint64,ctypes.c_uint64,ctypes.c_uint64,
-                 ctypes.c_double,ctypes.c_double,ctypes.c_uint64,ctypes.c_uint64,ctypes.c_char_p,ctypes.POINTER(_Stats),ctypes.c_char_p,ctypes.c_uint64]
+                 ctypes.c_double,ctypes.c_double,ctypes.c_uint64,ctypes.c_uint64,
+                 ctypes.c_double,ctypes.c_double,ctypes.c_char_p,ctypes.POINTER(_Stats),ctypes.c_char_p,ctypes.c_uint64]
     fn.restype=ctypes.c_int
     fn._owner_dll=dll
     return fn
@@ -56,16 +57,23 @@ class CompactMorse:
                  max_heap_entries=8_000_000,max_trace_bytes=300_000_000,
                  max_pairs=10_000_000,max_seconds=90.,local_first=False,
                  indexed_scheduler=False,adaptive_cohomology_ns_per_cell=0.0,
-                 adaptive_window=4096,adaptive_patience=2):
+                 adaptive_window=4096,adaptive_patience=2,
+                 adaptive_cohomology_ns_per_face=0.0,
+                 adaptive_cohomology_ns_per_incidence=0.0):
         import time
         t=time.perf_counter()
         self.path=Path(output_dir).resolve();self.path.mkdir(parents=True,exist_ok=True)
         for name,v in [('max_operations',max_operations),('max_fill',max_fill),('max_heap_entries',max_heap_entries),('max_trace_bytes',max_trace_bytes),('max_pairs',max_pairs)]:
             if not isinstance(v,int) or v<=0:raise ValueError(f'{name} must be a positive integer')
         if max_seconds<=0:raise ValueError('max_seconds must be positive')
+        for name,value in [('adaptive_cohomology_ns_per_face',adaptive_cohomology_ns_per_face),
+                           ('adaptive_cohomology_ns_per_incidence',adaptive_cohomology_ns_per_incidence)]:
+            if not np.isfinite(value) or value<0:
+                raise ValueError(f'{name} must be finite and nonnegative')
         if not np.isfinite(adaptive_cohomology_ns_per_cell) or adaptive_cohomology_ns_per_cell<0:
             raise ValueError('adaptive_cohomology_ns_per_cell must be finite and nonnegative')
-        if adaptive_cohomology_ns_per_cell and not indexed_scheduler:
+        if any((adaptive_cohomology_ns_per_cell, adaptive_cohomology_ns_per_face,
+                adaptive_cohomology_ns_per_incidence)) and not indexed_scheduler:
             raise ValueError('Adaptive stopping requires indexed_scheduler=True')
         if not isinstance(adaptive_window,int) or adaptive_window<1 or not isinstance(adaptive_patience,int) or adaptive_patience<1:
             raise ValueError('adaptive_window and adaptive_patience must be positive integers')
@@ -81,12 +89,15 @@ class CompactMorse:
                 self.shape[1],self.shape[2],block_voxels,int(local_first),int(indexed_scheduler),max_operations,
                 max_fill,max_heap_entries,max_trace_bytes,max_pairs,float(max_seconds),
                 float(adaptive_cohomology_ns_per_cell),int(adaptive_window),int(adaptive_patience),
+                float(adaptive_cohomology_ns_per_face),float(adaptive_cohomology_ns_per_incidence),
                 str(self.path).encode(),ctypes.byref(stats),err,512)
         if code:raise RuntimeError('Native Morse: '+err.value.decode())
         self.stats={key:int(getattr(stats,key)) for key,_ in _Stats._fields_}
         self.stats.update(self.pre_stats);self.stats['seconds']=time.perf_counter()-t
         self.stats['indexed_scheduler']=bool(indexed_scheduler)
         self.stats['adaptive_cohomology_ns_per_cell']=float(adaptive_cohomology_ns_per_cell)
+        self.stats['adaptive_cohomology_ns_per_face']=float(adaptive_cohomology_ns_per_face)
+        self.stats['adaptive_cohomology_ns_per_incidence']=float(adaptive_cohomology_ns_per_incidence)
         (self.path/'metadata.json').write_text(json.dumps({'shape': self.shape, 'stats': self.stats}), encoding='utf8')
         self._init_views()
 
@@ -308,6 +319,46 @@ class CompactMorse:
             raise ValueError('Requested pair ID not in native H1 catalog')
         return (pair_id, int(row['birth']), int(row['death']),
                 creator_packed, destroyer_packed)
+
+    _PROFILE_KEYS = (
+        'critical_cells', 'critical_edges', 'critical_faces', 'face_incidences',
+        'face_degree_squared', 'faces_with_nonzero_coboundary',
+        'annotation_xor_terms', 'annotation_updates', 'annotation_result_terms',
+        'annotation_added', 'annotation_removed', 'peak_annotation_entries',
+        'cohomology_operations', 'finite_h1_pairs',
+    )
+
+    def critical_structure_profile(self):
+        """Cheap pre-cohomology sparsity features from the exact critical CSR.
+
+        These can be computed before cohomology, unlike observed annotation
+        fill-in, and are suitable inputs for a predictive cost model.
+        """
+        dims = self.dims[self.critical]
+        counts = np.diff(self.critical_offsets)
+        faces = counts[dims == 2].astype(np.int64, copy=False)
+        return dict(
+            critical_cells=int(len(self.critical)),
+            critical_edges=int(np.count_nonzero(dims == 1)),
+            critical_faces=int(len(faces)),
+            face_incidences=int(faces.sum(dtype=np.int64)),
+            face_degree_squared=int(np.dot(faces, faces)),
+        )
+
+    def cohomology_profile(self):
+        """Actual sparse-annotation work counters from a completed H1 run.
+
+        These values cannot predict the same run without additional sampling;
+        they are intended for fitting/validating future cost models.
+        """
+        self.h1_records()
+        p = self.path / 'h1_pairs.bin.profile.bin'
+        if not p.is_file():
+            return None  # catalogs built before this instrumentation
+        raw = np.fromfile(p, dtype='<u8')
+        if len(raw) != len(self._PROFILE_KEYS):
+            raise RuntimeError('Inconsistent H1 cohomology profile format')
+        return dict(zip(self._PROFILE_KEYS, map(int, raw)))
 
     def h1_records(self, *, max_operations=100_000_000, max_seconds=120.,
                    max_annotation_entries=50_000_000,

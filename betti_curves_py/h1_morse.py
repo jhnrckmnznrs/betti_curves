@@ -150,6 +150,8 @@ def h1_persistence(volume, *, connectivity=26, output_dir=None,
                    cohomology_max_seconds=120.,
                    store_pair_ids=True,indexed_scheduler=False,
                    adaptive_cohomology_ns_per_cell=0.0,adaptive_window=4096,adaptive_patience=2,
+                   adaptive_cohomology_ns_per_face=0.0,
+                   adaptive_cohomology_ns_per_incidence=0.0,
                    cohomology_max_annotation_entries=50_000_000,
                    cohomology_max_output_pairs=10_000_000):
     """Exact finite H1 persistence with bounded native Morse reduction.
@@ -174,6 +176,8 @@ def h1_persistence(volume, *, connectivity=26, output_dir=None,
             max_pairs=max_pairs, max_seconds=max_seconds, local_first=local_first,
             indexed_scheduler=indexed_scheduler,
             adaptive_cohomology_ns_per_cell=adaptive_cohomology_ns_per_cell,
+            adaptive_cohomology_ns_per_face=adaptive_cohomology_ns_per_face,
+            adaptive_cohomology_ns_per_incidence=adaptive_cohomology_ns_per_incidence,
             adaptive_window=adaptive_window,adaptive_patience=adaptive_patience,
         )
         records = morse.h1_records(
@@ -194,6 +198,7 @@ def h1_persistence(volume, *, connectivity=26, output_dir=None,
             cohomology_meta.get('peak_annotation_entries', 0))
         statistics['cohomology_operations'] = int(cohomology_meta.get('operations', 0))
         statistics['cohomology_seconds'] = float(cohomology_meta.get('cohomology_seconds', 0.0))
+        statistics['cohomology_profile'] = morse.cohomology_profile()
         result = H1MorseResult(
             births=np.asarray(records['birth'], dtype=v.dtype).copy(),
             deaths=np.asarray(records['death'], dtype=v.dtype).copy(),

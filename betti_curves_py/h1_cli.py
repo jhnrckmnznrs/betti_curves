@@ -24,6 +24,10 @@ def main(argv=None):
     parser.add_argument('--max-morse-operations', type=int, default=8_000_000)
     parser.add_argument('--adaptive-cohomology-ns-per-cell', type=float, default=0.0,
                         help='Experimental cost estimate; 0 disables adaptive stopping (default)')
+    parser.add_argument('--adaptive-cohomology-ns-per-face', type=float, default=0.0,
+                        help='Experimental calibrated nanoseconds saved per eliminated critical face')
+    parser.add_argument('--adaptive-cohomology-ns-per-incidence', type=float, default=0.0,
+                        help='Experimental calibrated nanoseconds per removed critical face-boundary incidence')
     parser.add_argument('--adaptive-window', type=int, default=4096)
     parser.add_argument('--adaptive-patience', type=int, default=2)
     parser.add_argument('--cohomology-max-annotation-entries', type=int, default=50_000_000)
@@ -45,6 +49,8 @@ def main(argv=None):
                 'indexed_scheduler':args.indexed_scheduler,'max_heap_entries':args.max_heap_entries,
                 'max_operations':args.max_morse_operations,
                 'adaptive_cohomology_ns_per_cell':args.adaptive_cohomology_ns_per_cell,
+                'adaptive_cohomology_ns_per_face':args.adaptive_cohomology_ns_per_face,
+                'adaptive_cohomology_ns_per_incidence':args.adaptive_cohomology_ns_per_incidence,
                 'adaptive_window':args.adaptive_window,
                 'adaptive_patience':args.adaptive_patience,
                 'cohomology_max_annotation_entries':args.cohomology_max_annotation_entries,

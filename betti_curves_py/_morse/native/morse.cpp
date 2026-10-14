@@ -13,9 +13,11 @@
 #include <tuple>
 #include <vector>
 #include <limits>
+#include <cmath>
 
 struct Stats {
   uint64_t remaining,pairs,operations,trace_bytes,nonfree,tile_pairs,hit_budget,adaptive_stopped,adaptive_windows;
+  uint64_t critical_faces,critical_face_incidences;
 };
 using U=uint32_t;
 using V=std::vector<U>;
@@ -70,6 +72,7 @@ extern "C" int compact_morse_run(
   int local_first,int indexed_scheduler,uint64_t max_operations,uint64_t max_fill,uint64_t max_heap,
   uint64_t max_trace_bytes,uint64_t max_pairs,double max_seconds,
   double adaptive_cohomology_ns_per_cell,uint64_t adaptive_window,uint64_t adaptive_patience,
+  double adaptive_cohomology_ns_per_face,double adaptive_cohomology_ns_per_incidence,
   const char* output_dir,Stats* stats,char*err,uint64_t err_size) {
  try {
   using Clock=std::chrono::steady_clock;
@@ -87,8 +90,14 @@ extern "C" int compact_morse_run(
     }
   }
   for(V& row:rows)std::sort(row.begin(),row.end());
-  if(adaptive_cohomology_ns_per_cell<0.0 ||
-     (adaptive_cohomology_ns_per_cell>0.0 && (!indexed_scheduler || !adaptive_window || !adaptive_patience)))
+  if(!std::isfinite(adaptive_cohomology_ns_per_cell) ||
+     !std::isfinite(adaptive_cohomology_ns_per_face) ||
+     !std::isfinite(adaptive_cohomology_ns_per_incidence) ||
+     adaptive_cohomology_ns_per_cell<0.0 || adaptive_cohomology_ns_per_face<0.0 ||
+     adaptive_cohomology_ns_per_incidence<0.0 ||
+     ((adaptive_cohomology_ns_per_cell>0.0 || adaptive_cohomology_ns_per_face>0.0 ||
+       adaptive_cohomology_ns_per_incidence>0.0) &&
+      (!indexed_scheduler || !adaptive_window || !adaptive_patience)))
     throw std::runtime_error("Invalid adaptive stopping configuration");
   const std::string base(output_dir);
   std::ofstream tr(base+"/trace.bin",std::ios::binary|std::ios::trunc);
@@ -97,6 +106,8 @@ extern "C" int compact_morse_run(
   uint64_t trace_bytes=0;
   uint64_t pairs=0,ops=0,nonfree=0,tile_pairs=0;
   bool hit=false,adaptive_stopped=false;uint64_t adaptive_windows=0;
+  uint64_t critical_faces=0,critical_face_incidences=0;
+  for(U j=0;j<n;j++)if(dims[j]==2){critical_faces++;critical_face_incidences+=cols[j].size();}
   auto tile=[&](U i){
     uint64_t p=ids[i],sz=2ull*nz+1,sy=2ull*ny+1;
     return std::make_tuple(p/(sy*sz)/(2*block_voxels),((p/sz)%sy)/(2*block_voxels),(p%sz)/(2*block_voxels));
@@ -150,6 +161,7 @@ extern "C" int compact_morse_run(
         const V old=cols[x];
         V neu=symdiff(old,boundary);
         V toggled=symdiff(old,neu);
+        if(dims[x]==2){critical_face_incidences-=old.size();critical_face_incidences+=neu.size();}
         for(U f:toggled){
           if(contains(neu,f))add_val(rows[f],x);
           else erase_val(rows[f],x);
@@ -157,9 +169,11 @@ extern "C" int compact_morse_run(
         }
         cols[x]=std::move(neu);
       }
-      for(U y:upper_rows){erase_val(cols[y],b);}
+      for(U y:upper_rows){if(dims[y]==2 && contains(cols[y],b))critical_face_incidences--;erase_val(cols[y],b);}
       for(U f:cols[b])erase_val(rows[f],b);
       for(U f:cols[a])erase_val(rows[f],a);
+      if(dims[a]==2){critical_faces--;critical_face_incidences-=cols[a].size();}
+      if(dims[b]==2){critical_faces--;critical_face_incidences-=cols[b].size();}
       cols[a].clear();cols[b].clear();rows[a].clear();rows[b].clear();
       alive[a]=0;alive[b]=0;
       ops+=cost;pairs++;
@@ -181,15 +195,23 @@ extern "C" int compact_morse_run(
     // ever executed: every finished cancellation is a filtered chain homotopy.
     auto checkpoint_time=Clock::now();
     uint64_t checkpoint_pairs=pairs, unprofitable_windows=0;
+    uint64_t checkpoint_faces=critical_faces,checkpoint_incidences=critical_face_incidences;
     auto checkpoint=[&](){
-      if(adaptive_cohomology_ns_per_cell<=0.0||pairs-checkpoint_pairs<adaptive_window)return false;
+      if((adaptive_cohomology_ns_per_cell<=0.0 && adaptive_cohomology_ns_per_face<=0.0 &&
+          adaptive_cohomology_ns_per_incidence<=0.0)||pairs-checkpoint_pairs<adaptive_window)return false;
       auto now=Clock::now();
       double observed_ns=std::chrono::duration<double,std::nano>(now-checkpoint_time).count();
       double saved_ns=2.0*static_cast<double>(pairs-checkpoint_pairs)*adaptive_cohomology_ns_per_cell;
+      saved_ns+=static_cast<double>(static_cast<int64_t>(checkpoint_faces)-static_cast<int64_t>(critical_faces))
+          *adaptive_cohomology_ns_per_face;
+      saved_ns+=static_cast<double>(static_cast<int64_t>(checkpoint_incidences)-static_cast<int64_t>(critical_face_incidences))
+          *adaptive_cohomology_ns_per_incidence;
+      saved_ns=std::max(0.0,saved_ns);
       adaptive_windows++;
       if(observed_ns>saved_ns)unprofitable_windows++;
       else unprofitable_windows=0;
       checkpoint_time=now;checkpoint_pairs=pairs;
+      checkpoint_faces=critical_faces;checkpoint_incidences=critical_face_incidences;
       if(unprofitable_windows>=adaptive_patience){adaptive_stopped=true;return true;}
       return false;
     };
@@ -223,6 +245,10 @@ extern "C" int compact_morse_run(
       }
     };
     refill();
+    // Constructing the initial heap is an unavoidable setup cost, not the
+    // marginal time of the cancellation window. Do not charge it to that
+    // window, or even profitable cancellations can be stopped prematurely.
+    checkpoint_time=Clock::now();
     uint64_t attempts=0;
     while((!heap.empty()||cursor<n)&&pairs<max_pairs){
       if(heap.empty()){refill();if(heap.empty())break;}
@@ -251,12 +277,15 @@ extern "C" int compact_morse_run(
       V touched=boundary;
       for(U x:affected){
         const V old=cols[x];V neu=symdiff(old,boundary);V toggled=symdiff(old,neu);
+        if(dims[x]==2){critical_face_incidences-=old.size();critical_face_incidences+=neu.size();}
         for(U f:toggled){if(contains(neu,f))add_val(rows[f],x);else erase_val(rows[f],x);touched.push_back(f);}
         cols[x]=std::move(neu);
       }
-      for(U y:upper_rows)erase_val(cols[y],b);
+      for(U y:upper_rows){if(dims[y]==2 && contains(cols[y],b))critical_face_incidences--;erase_val(cols[y],b);}
       for(U f:cols[b])erase_val(rows[f],b);
       for(U f:cols[a])erase_val(rows[f],a);
+      if(dims[a]==2){critical_faces--;critical_face_incidences-=cols[a].size();}
+      if(dims[b]==2){critical_faces--;critical_face_incidences-=cols[b].size();}
       cols[a].clear();cols[b].clear();rows[a].clear();rows[b].clear();alive[a]=0;alive[b]=0;
       ops+=best.cost;pairs++;
       if(checkpoint())return;
@@ -287,7 +316,8 @@ extern "C" int compact_morse_run(
   }
   surv.close();off.close();dat.close();
   if(!surv||!off||!dat)throw std::runtime_error("Critical CSR write failure");
-  *stats=Stats{remaining,pairs,ops,trace_bytes,nonfree,tile_pairs,hit?1ull:0ull,adaptive_stopped?1ull:0ull,adaptive_windows};
+  *stats=Stats{remaining,pairs,ops,trace_bytes,nonfree,tile_pairs,hit?1ull:0ull,adaptive_stopped?1ull:0ull,adaptive_windows,
+     critical_faces,critical_face_incidences};
   return 0;
  }catch(const std::exception& e){
    if(err_size){std::strncpy(err,e.what(),err_size-1);err[err_size-1]='\0';}
@@ -326,6 +356,10 @@ extern "C" int compact_h1_run(
   std::ofstream out(pair_path,std::ios::binary|std::ios::trunc);
   if(!out)throw std::runtime_error("Cannot open persistence pair catalog");
   uint64_t count=0,entries=0,max_seen=0,ops=0;
+  // Low-overhead empirical diagnostics. These do not affect the reduction.
+  uint64_t edge_cells=0,face_cells=0,face_incidences=0,face_squared=0;
+  uint64_t face_nonzero=0,annotation_xor_terms=0,annotation_updates=0;
+  uint64_t annotation_result_terms=0,annotation_added=0,annotation_removed=0;
   auto check_entries=[&](){max_seen=std::max(max_seen,entries);if(entries>max_annotation_entries)throw std::runtime_error("Cohomology annotation budget exceeded");};
   for(U step=0;step<n;step++){
     if((step&8191)==0&&std::chrono::duration<double>(Clock::now()-start).count()>max_seconds)
@@ -333,6 +367,7 @@ extern "C" int compact_h1_run(
     U c=order[step],old=critical[c];
     int d=all_dims[old];
     if(d==1){
+      edge_cells++;
       uint64_t lo=offsets[c],hi=offsets[c+1];
       if(hi-lo==2){
         int32_t aa=lookup[data[lo]],bb=lookup[data[lo+1]];
@@ -342,13 +377,18 @@ extern "C" int compact_h1_run(
       }else if(hi!=lo)throw std::runtime_error("Reduced edge has invalid 0-boundary");
       annotation[c]={c};reverse[c]={c};entries++;check_entries();
     }else if(d==2){
+      face_cells++;
+      uint64_t arity=offsets[c+1]-offsets[c];
+      face_incidences+=arity;face_squared+=arity*arity;
       V pivot_set;
       for(uint64_t j=offsets[c];j<offsets[c+1];j++){
         int32_t edge=lookup[data[j]];
         if(edge<0)throw std::runtime_error("Face has missing edge");
+        annotation_xor_terms+=pivot_set.size()+annotation[edge].size();
         pivot_set=symdiff(pivot_set,annotation[edge]);
       }
       if(pivot_set.empty())continue;
+      face_nonzero++;
       U youngest=pivot_set[0];
       for(U item:pivot_set)if(rank[item]>rank[youngest])youngest=item;
       if(all_levels[critical[youngest]]<all_levels[old]){
@@ -362,7 +402,13 @@ extern "C" int compact_h1_run(
       }
       V affected=reverse[youngest];
       for(U edge:affected){
-        V prev=annotation[edge];V next=symdiff(prev,pivot_set);
+        V prev=annotation[edge];
+        annotation_updates++;
+        annotation_xor_terms+=prev.size()+pivot_set.size();
+        V next=symdiff(prev,pivot_set);
+        annotation_result_terms+=next.size();
+        if(next.size()>prev.size())annotation_added+=next.size()-prev.size();
+        else annotation_removed+=prev.size()-next.size();
         V touched=symdiff(prev,next);
         for(U gen:touched){
           if(contains(next,gen))add_val(reverse[gen],edge);
@@ -377,6 +423,14 @@ extern "C" int compact_h1_run(
     }
   }
   out.close();if(!out)throw std::runtime_error("Cannot write persistence pairs");
+  // Fixed-size diagnostics; a missing file never makes a partial barcode valid.
+  const uint64_t profile[]={n,edge_cells,face_cells,face_incidences,
+     face_squared,face_nonzero,annotation_xor_terms,annotation_updates,
+     annotation_result_terms,annotation_added,annotation_removed,max_seen,ops,count};
+  std::ofstream profiler(std::string(pair_path)+".profile.bin",std::ios::binary|std::ios::trunc);
+  if(!profiler)throw std::runtime_error("Cannot write cohomology profile");
+  profiler.write(reinterpret_cast<const char*>(profile),sizeof(profile));
+  profiler.close();if(!profiler)throw std::runtime_error("Cohomology profile write failure");
   *pair_count=count;*op_count=ops;*peak_entries=max_seen;
   return 0;
  }catch(const std::exception&e){

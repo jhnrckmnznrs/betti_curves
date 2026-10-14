@@ -192,6 +192,29 @@ The rule measures elapsed time in consecutive cancellation windows, each removin
 
 Use `betti-h1-py ... --backend morse --indexed-scheduler --adaptive-cohomology-ns-per-cell 800` for the equivalent command-line option. For reproducible comparisons, run `python benchmarks/benchmark_h1_adaptive.py --size 32 --seed 11`, which verifies equality of barcode multisets under minimal, adaptive, and extensive Morse work. On tested random 64³ workloads, the adaptive rule was faster than extensive simplification, but was **not reliably faster than very limited simplification**. It is an experimental scheduling option rather than a general high-entropy large-volume solution.
 
+### Cohomology-aware Morse cost diagnostics
+
+The optional native H1 backend can estimate the marginal saving from cancellations using the **number of surviving critical faces** and **nonzero face-boundary incidences**, not only critical-cell count. It also records observed cohomology annotation updates, XOR work, growth, and peak entries for analysis. These counters do not affect exact persistence results.
+
+```python
+from betti_curves_py import h1_persistence
+
+result = h1_persistence(
+    volume, connectivity=26, indexed_scheduler=True,
+    adaptive_cohomology_ns_per_face=2200.0,
+    adaptive_cohomology_ns_per_incidence=0.0,
+    adaptive_window=4096, adaptive_patience=2,
+    output_dir="h1_catalog",
+)
+print(result.statistics["critical_faces"])
+print(result.statistics["critical_face_incidences"])
+print(result.statistics["cohomology_profile"])
+```
+
+Both new stopping rates default to zero. The example rate is fitted to a limited synthetic CPU study, **not a universal recommended value**. The face and incidence rates should be calibrated jointly; separately fitted coefficients should not simply be added because those inputs are correlated. The scheduler compares observed cancellation-window time against estimated downstream cohomology saving and stops only after complete, valid filtration-compatible cancellations. Thus it preserves the barcode, but **does not guarantee a faster or globally optimal runtime**. The option requires `indexed_scheduler=True` and is also available as `--adaptive-cohomology-ns-per-face` and `--adaptive-cohomology-ns-per-incidence` in `betti-h1-py`.
+
+To reproduce a bounded synthetic comparison, use `python benchmarks/benchmark_h1_cost_model.py --sizes 24 32 --seeds 2 7` (benchmark-only SciPy dependency). The benchmark validates prospective structural predictions on held-out volumes; observed annotation-work counters are post-hoc and must not be used as an online forecast for the same computation. In 59 individual synthetic runs over 20 volumes, critical-cell count produced held-out R² around 0.907, compared with 0.939 for edges/faces/incidences and 0.965 for **post-hoc** annotation-work features. Face count alone performed approximately as well as the full structural model in this dataset. On the tested 48³–64³ random inputs, a structural stopping rule avoided expensive extensive cancellation but did not reliably beat minimal cancellation or the simpler cell-count rule. The solver is still not fully out of core.
+
 ## Python API
 
 ```python
