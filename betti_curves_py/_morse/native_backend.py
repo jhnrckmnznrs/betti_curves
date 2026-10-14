@@ -42,7 +42,7 @@ def build_native(*,cache_dir=None):
     fn=dll.compact_morse_run
     fn.argtypes=[ctypes.POINTER(ctypes.c_uint32),ctypes.POINTER(ctypes.c_int32),ctypes.POINTER(ctypes.c_uint8),
                  ctypes.POINTER(ctypes.c_uint64),ctypes.POINTER(ctypes.c_uint32),ctypes.c_uint64,
-                 ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,
+                 ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,
                  ctypes.c_uint64,ctypes.c_uint64,ctypes.c_uint64,ctypes.c_uint64,ctypes.c_uint64,
                  ctypes.c_double,ctypes.c_char_p,ctypes.POINTER(_Stats),ctypes.c_char_p,ctypes.c_uint64]
     fn.restype=ctypes.c_int
@@ -53,7 +53,8 @@ class CompactMorse:
     def __init__(self,volume,output_dir,*,pre_collapse=True,block_voxels=8,
                  max_cells=3_000_000,max_operations=8_000_000,max_fill=128,
                  max_heap_entries=8_000_000,max_trace_bytes=300_000_000,
-                 max_pairs=10_000_000,max_seconds=90.,local_first=False):
+                 max_pairs=10_000_000,max_seconds=90.,local_first=False,
+                 indexed_scheduler=False):
         import time
         t=time.perf_counter()
         self.path=Path(output_dir).resolve();self.path.mkdir(parents=True,exist_ok=True)
@@ -69,12 +70,13 @@ class CompactMorse:
         def ptr(key,kind):return prep[key].ctypes.data_as(ctypes.POINTER(kind))
         code=fn(ptr('ids',ctypes.c_uint32),ptr('levels',ctypes.c_int32),ptr('dims',ctypes.c_uint8),
                 ptr('offsets',ctypes.c_uint64),ptr('data',ctypes.c_uint32),len(prep['ids']),
-                self.shape[1],self.shape[2],block_voxels,int(local_first),max_operations,
+                self.shape[1],self.shape[2],block_voxels,int(local_first),int(indexed_scheduler),max_operations,
                 max_fill,max_heap_entries,max_trace_bytes,max_pairs,float(max_seconds),
                 str(self.path).encode(),ctypes.byref(stats),err,512)
         if code:raise RuntimeError('Native Morse: '+err.value.decode())
         self.stats={key:int(getattr(stats,key)) for key,_ in _Stats._fields_}
         self.stats.update(self.pre_stats);self.stats['seconds']=time.perf_counter()-t
+        self.stats['indexed_scheduler']=bool(indexed_scheduler)
         (self.path/'metadata.json').write_text(json.dumps({'shape': self.shape, 'stats': self.stats}), encoding='utf8')
         self._init_views()
 
@@ -298,12 +300,17 @@ class CompactMorse:
                 creator_packed, destroyer_packed)
 
     def h1_records(self, *, max_operations=100_000_000, max_seconds=120.,
+                   max_annotation_entries=50_000_000,
+                   max_output_pairs=10_000_000,
                    use_cache=True):
         """Native H1 barcode, cached durably for later class-aware replay.
 
         The work/time budgets apply on a fresh computation; a complete cached
         result needs no recomputation. `use_cache=False` forces an exact rerun.
         """
+        if (not isinstance(max_annotation_entries, int) or max_annotation_entries <= 0 or
+                not isinstance(max_output_pairs, int) or max_output_pairs <= 0):
+            raise ValueError('Positive cohomology annotation and barcode budgets required')
         records = self._cached_h1_records() if use_cache else None
         if records is None:
             exported = build_native()
@@ -313,14 +320,15 @@ class CompactMorse:
                             ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64,
                             ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint64),
                             ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64,
-                            ctypes.c_uint64, ctypes.c_double, ctypes.c_char_p,
+                            ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_double, ctypes.c_char_p,
                             ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
-                            ctypes.c_char_p, ctypes.c_uint64]
+                            ctypes.POINTER(ctypes.c_uint64), ctypes.c_char_p, ctypes.c_uint64]
             run.restype = ctypes.c_int
             def ptr(arr, type_):
                 return np.asarray(arr).ctypes.data_as(ctypes.POINTER(type_))
             count = ctypes.c_uint64()
             operations = ctypes.c_uint64()
+            peak_entries = ctypes.c_uint64()
             err = ctypes.create_string_buffer(512)
             # Only the complete metadata establishes validity. An interrupted
             # run cannot accidentally turn a truncated output into a cache hit.
@@ -333,16 +341,17 @@ class CompactMorse:
                        ptr(self.critical, ctypes.c_uint32),
                        ptr(self.critical_offsets, ctypes.c_uint64),
                        ptr(self.critical_data, ctypes.c_uint32),
-                       len(self.critical), int(max_operations), float(max_seconds),
+                       len(self.critical), int(max_operations), int(max_annotation_entries), int(max_output_pairs), float(max_seconds),
                        str(target).encode(), ctypes.byref(count),
-                       ctypes.byref(operations), err, 512)
+                       ctypes.byref(operations), ctypes.byref(peak_entries), err, 512)
             if code:
                 raise RuntimeError('Native H1: ' + err.value.decode())
             if target.stat().st_size != count.value * self._H1_RECORD_DTYPE.itemsize:
                 raise RuntimeError('Native H1 output length mismatch')
             metadata = dict(format=1, count=int(count.value),
                             signature=self._h1_inputs_signature(),
-                            operations=int(operations.value))
+                            operations=int(operations.value),
+                            peak_annotation_entries=int(peak_entries.value))
             temp_meta = self.path / 'h1_pairs_metadata.build.json'
             temp_meta.write_text(json.dumps(metadata), encoding='utf8')
             os.replace(temp_meta, meta_path)

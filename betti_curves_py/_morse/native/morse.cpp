@@ -7,6 +7,7 @@
 #include <fstream>
 #include <numeric>
 #include <queue>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -36,10 +37,37 @@ struct Greater {bool operator()(const Candidate&x,const Candidate&y)const{
 }};
 static void write_u32(std::ofstream& out,U v) {out.write(reinterpret_cast<const char*>(&v),sizeof(v));}
 
+// A single live candidate per lower cell, with in-place updates. Unlike a
+// duplicate-rich priority queue its storage never exceeds O(number of cells).
+struct IndexedCandidates {
+ std::vector<Candidate> items;
+ std::vector<int32_t> location;
+ Greater greater;
+ explicit IndexedCandidates(size_t n):location(n,-1){}
+ bool less(const Candidate& a,const Candidate& b) const {return greater(b,a);}
+ void swap_at(size_t i,size_t j){
+   std::swap(items[i],items[j]); location[items[i].a]=static_cast<int32_t>(i);
+   location[items[j].a]=static_cast<int32_t>(j);
+ }
+ void up(size_t i){while(i){size_t j=(i-1)/2;if(!less(items[i],items[j]))break;swap_at(i,j);i=j;}}
+ void down(size_t i){size_t n=items.size();while(2*i+1<n){size_t j=2*i+1;if(j+1<n&&less(items[j+1],items[j]))j++;
+   if(!less(items[j],items[i]))break;swap_at(i,j);i=j;}}
+ void erase(U a){int32_t p=location[a];if(p<0)return;size_t i=static_cast<size_t>(p);
+   location[a]=-1;size_t last=items.size()-1;
+   if(i!=last){items[i]=items[last];location[items[i].a]=static_cast<int32_t>(i);}
+   items.pop_back();if(i<items.size()){U moved=items[i].a;up(i);down(static_cast<size_t>(location[moved]));}}
+ void update(const Candidate& c){int32_t p=location[c.a];if(p<0){location[c.a]=static_cast<int32_t>(items.size());items.push_back(c);up(items.size()-1);}
+   else{size_t i=static_cast<size_t>(p);items[i]=c;up(i);down(static_cast<size_t>(location[c.a]));}}
+ Candidate pop(){Candidate c=items.front();erase(c.a);return c;}
+ bool empty()const{return items.empty();}
+ size_t size()const{return items.size();}
+};
+
+
 extern "C" int compact_morse_run(
   const U* ids,const int32_t* levels,const uint8_t* dims,const uint64_t* offsets,
   const U* data,uint64_t n,int32_t ny,int32_t nz,int32_t block_voxels,
-  int local_first,uint64_t max_operations,uint64_t max_fill,uint64_t max_heap,
+  int local_first,int indexed_scheduler,uint64_t max_operations,uint64_t max_fill,uint64_t max_heap,
   uint64_t max_trace_bytes,uint64_t max_pairs,double max_seconds,
   const char* output_dir,Stats* stats,char*err,uint64_t err_size) {
  try {
@@ -139,8 +167,86 @@ extern "C" int compact_morse_run(
       }
     }
   };
-  if(local_first){phase(true);if(!hit&&pairs<max_pairs)phase(false);}
-  else phase(false);
+
+  auto indexed_phase=[&](bool local){
+    IndexedCandidates heap(n);
+    bool skipped=false;
+    auto pick=[&](U a){
+      heap.erase(a);
+      if(!alive[a])return;
+      bool found=false; Candidate best{};
+      for(U b:rows[a]){
+        if(!alive[b]||levels[a]!=levels[b])continue;
+        if(local&&tile(a)!=tile(b))continue;
+        uint64_t cost=(rows[a].size()-1ull)*(cols[b].size()-1ull);
+        if(cost>max_fill)continue;
+        Candidate c{cost,static_cast<U>(cols[b].size()),levels[a],dims[a],a,b};
+        if(!found||heap.less(c,best)){best=c;found=true;}
+      }
+      if(found){
+        if(heap.location[a]>=0||heap.size()<max_heap)heap.update(best);
+        else skipped=true; // Exact reduction still valid; this cancellation is deferred.
+      }
+    };
+    // Populate a bounded candidate window incrementally, rather than quitting
+    // before the first cancellation when the filtration exceeds max_heap.
+    // Eligible cells not admitted because of capacity may remain uncollapsed;
+    // this affects compression, never the persistence of the retained complex.
+    uint64_t cursor=0;
+    auto refill=[&](){
+      while(cursor<n&&heap.size()<max_heap){
+        U a=static_cast<U>(cursor++);
+        if(alive[a])pick(a);
+      }
+    };
+    refill();
+    uint64_t attempts=0;
+    while((!heap.empty()||cursor<n)&&pairs<max_pairs){
+      if(heap.empty()){refill();if(heap.empty())break;}
+      if((++attempts&4095)==0&&std::chrono::duration<double>(Clock::now()-start).count()>max_seconds){hit=true;return;}
+      Candidate item=heap.pop();U a=item.a,b=item.b;
+      if(!alive[a])continue;
+      // Revalidate every cost against the current differential and row support.
+      // If another incident coface has become cheaper, update rather than
+      // executing the stale candidate. Both choices are filtered cancellations.
+      pick(a);
+      if(heap.location[a]<0)continue;
+      Candidate best=heap.items[static_cast<size_t>(heap.location[a])];
+      if(best.b!=b||best.cost!=item.cost||best.length!=item.length)continue;
+      heap.erase(a);
+      if(ops+best.cost>max_operations){hit=true;return;}
+      const V boundary=cols[b];V image=boundary;erase_val(image,a);
+      V affected=rows[a];erase_val(affected,b);V upper_rows=rows[b];
+      uint64_t size=16+4ull*(image.size()+affected.size());
+      if(trace_bytes+size>max_trace_bytes){hit=true;return;}
+      uint64_t off=trace_bytes;idx.write(reinterpret_cast<const char*>(&off),8);
+      write_u32(tr,a);write_u32(tr,b);
+      write_u32(tr,static_cast<U>(image.size()));write_u32(tr,static_cast<U>(affected.size()));
+      if(!image.empty())tr.write(reinterpret_cast<const char*>(image.data()),image.size()*4);
+      if(!affected.empty())tr.write(reinterpret_cast<const char*>(affected.data()),affected.size()*4);
+      trace_bytes+=size;if(!affected.empty())nonfree++;if(local)tile_pairs++;
+      V touched=boundary;
+      for(U x:affected){
+        const V old=cols[x];V neu=symdiff(old,boundary);V toggled=symdiff(old,neu);
+        for(U f:toggled){if(contains(neu,f))add_val(rows[f],x);else erase_val(rows[f],x);touched.push_back(f);}
+        cols[x]=std::move(neu);
+      }
+      for(U y:upper_rows)erase_val(cols[y],b);
+      for(U f:cols[b])erase_val(rows[f],b);
+      for(U f:cols[a])erase_val(rows[f],a);
+      cols[a].clear();cols[b].clear();rows[a].clear();rows[b].clear();alive[a]=0;alive[b]=0;
+      ops+=best.cost;pairs++;
+      std::sort(touched.begin(),touched.end());touched.erase(std::unique(touched.begin(),touched.end()),touched.end());
+      for(U f:touched)if(alive[f])pick(f);
+      refill();
+    }
+    if(skipped)hit=true;
+  };
+  if(indexed_scheduler){if(local_first){indexed_phase(true);if(!hit&&pairs<max_pairs)indexed_phase(false);}
+    else indexed_phase(false);}
+  else {if(local_first){phase(true);if(!hit&&pairs<max_pairs)phase(false);}
+    else phase(false);}
+
   tr.close();idx.close();
   if(!tr||!idx)throw std::runtime_error("Trace output write failure");
   std::ofstream surv(base+"/critical_index.bin",std::ios::binary|std::ios::trunc),
@@ -171,8 +277,8 @@ extern "C" int compact_morse_run(
 extern "C" int compact_h1_run(
   const U* cell_ids,const int32_t* all_levels,const uint8_t* all_dims,
   uint64_t precursor_n,const U* critical,const uint64_t* offsets,
-  const U* data,uint64_t n,uint64_t max_operations,double max_seconds,
-  const char* pair_path,uint64_t* pair_count,uint64_t* op_count,
+  const U* data,uint64_t n,uint64_t max_operations,uint64_t max_annotation_entries,uint64_t max_output_pairs,double max_seconds,
+  const char* pair_path,uint64_t* pair_count,uint64_t* op_count,uint64_t* peak_entries,
   char*err,uint64_t err_size) {
  try{
   using Clock=std::chrono::steady_clock;
@@ -193,8 +299,10 @@ extern "C" int compact_h1_run(
   std::vector<U> parent(n);std::iota(parent.begin(),parent.end(),0);
   auto root=[&](U p){while(parent[p]!=p){parent[p]=parent[parent[p]];p=parent[p];}return p;};
   std::vector<V> annotation(n),reverse(n);
-  std::vector<std::tuple<U,U,int32_t,int32_t>> pairs;
-  uint64_t ops=0;
+  std::ofstream out(pair_path,std::ios::binary|std::ios::trunc);
+  if(!out)throw std::runtime_error("Cannot open persistence pair catalog");
+  uint64_t count=0,entries=0,max_seen=0,ops=0;
+  auto check_entries=[&](){max_seen=std::max(max_seen,entries);if(entries>max_annotation_entries)throw std::runtime_error("Cohomology annotation budget exceeded");};
   for(U step=0;step<n;step++){
     if((step&8191)==0&&std::chrono::duration<double>(Clock::now()-start).count()>max_seconds)
        throw std::runtime_error("Cohomology time budget exceeded");
@@ -208,7 +316,7 @@ extern "C" int compact_h1_run(
         U a=root(static_cast<U>(aa)),b=root(static_cast<U>(bb));
         if(a!=b){parent[a]=b;continue;}
       }else if(hi!=lo)throw std::runtime_error("Reduced edge has invalid 0-boundary");
-      annotation[c]={c};reverse[c]={c};
+      annotation[c]={c};reverse[c]={c};entries++;check_entries();
     }else if(d==2){
       V pivot_set;
       for(uint64_t j=offsets[c];j<offsets[c+1];j++){
@@ -219,8 +327,15 @@ extern "C" int compact_h1_run(
       if(pivot_set.empty())continue;
       U youngest=pivot_set[0];
       for(U item:pivot_set)if(rank[item]>rank[youngest])youngest=item;
-      if(all_levels[critical[youngest]]<all_levels[old])
-        pairs.emplace_back(critical[youngest],old,all_levels[critical[youngest]],all_levels[old]);
+      if(all_levels[critical[youngest]]<all_levels[old]){
+        if(count>=max_output_pairs)throw std::runtime_error("H1 barcode output budget exceeded");
+        U birth_id=critical[youngest];U death_id=old;
+        int32_t birth=all_levels[birth_id],death=all_levels[death_id];
+        write_u32(out,birth_id);write_u32(out,death_id);
+        out.write(reinterpret_cast<const char*>(&birth),4);
+        out.write(reinterpret_cast<const char*>(&death),4);
+        count++;
+      }
       V affected=reverse[youngest];
       for(U edge:affected){
         V prev=annotation[edge];V next=symdiff(prev,pivot_set);
@@ -229,6 +344,7 @@ extern "C" int compact_h1_run(
           if(contains(next,gen))add_val(reverse[gen],edge);
           else erase_val(reverse[gen],edge);
         }
+        entries=entries-prev.size()+next.size();check_entries();
         annotation[edge]=std::move(next);
         ops+=prev.size()+pivot_set.size();
         if(ops>max_operations)throw std::runtime_error("Cohomology operation budget exceeded");
@@ -236,17 +352,8 @@ extern "C" int compact_h1_run(
       if(!reverse[youngest].empty())throw std::runtime_error("Annotation elimination failure");
     }
   }
-  std::ofstream out(pair_path,std::ios::binary|std::ios::trunc);
-  if(!out)throw std::runtime_error("Cannot open persistence pair catalog");
-  for(const auto& p:pairs){
-    U a,b;int32_t birth,death;std::tie(a,b,birth,death)=p;
-    out.write(reinterpret_cast<const char*>(&a),4);
-    out.write(reinterpret_cast<const char*>(&b),4);
-    out.write(reinterpret_cast<const char*>(&birth),4);
-    out.write(reinterpret_cast<const char*>(&death),4);
-  }
   out.close();if(!out)throw std::runtime_error("Cannot write persistence pairs");
-  *pair_count=pairs.size();*op_count=ops;
+  *pair_count=count;*op_count=ops;*peak_entries=max_seen;
   return 0;
  }catch(const std::exception&e){
    if(err_size){std::strncpy(err,e.what(),err_size-1);err[err_size-1]='\0';}

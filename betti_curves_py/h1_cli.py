@@ -18,6 +18,12 @@ def main(argv=None):
     parser.add_argument('--max-cells', type=int, default=3_000_000)
     parser.add_argument('--max-seconds', type=float, default=90.)
     parser.add_argument('--block-voxels', type=int, default=8)
+    parser.add_argument('--indexed-scheduler', action='store_true',
+                        help='Bounded one-candidate-per-face Morse scheduler')
+    parser.add_argument('--max-heap-entries', type=int, default=8_000_000)
+    parser.add_argument('--max-morse-operations', type=int, default=8_000_000)
+    parser.add_argument('--cohomology-max-annotation-entries', type=int, default=50_000_000)
+    parser.add_argument('--cohomology-max-output-pairs', type=int, default=10_000_000)
     parser.add_argument('--no-validation', action='store_true')
     args = parser.parse_args(argv)
     path = Path(args.source)
@@ -31,7 +37,11 @@ def main(argv=None):
     from .io import atomic_csv
     output = Path(args.output_dir)
     options = ({'max_cells':args.max_cells,
-                'max_seconds':args.max_seconds,'block_voxels':args.block_voxels}
+                'max_seconds':args.max_seconds,'block_voxels':args.block_voxels,
+                'indexed_scheduler':args.indexed_scheduler,'max_heap_entries':args.max_heap_entries,
+                'max_operations':args.max_morse_operations,
+                'cohomology_max_annotation_entries':args.cohomology_max_annotation_entries,
+                'cohomology_max_output_pairs':args.cohomology_max_output_pairs}
                if args.backend=='morse' else {})
     result=analyze_volume(
         volume, connectivity=args.connectivity, h1_backend=args.backend,

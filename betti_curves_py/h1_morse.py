@@ -148,7 +148,9 @@ def h1_persistence(volume, *, connectivity=26, output_dir=None,
                    max_pairs=10_000_000, max_seconds=90., local_first=False,
                    cohomology_max_operations=100_000_000,
                    cohomology_max_seconds=120.,
-                   store_pair_ids=True):
+                   store_pair_ids=True,indexed_scheduler=False,
+                   cohomology_max_annotation_entries=50_000_000,
+                   cohomology_max_output_pairs=10_000_000):
     """Exact finite H1 persistence with bounded native Morse reduction.
 
     The full cubical complex currently must fit in memory.  Larger inputs
@@ -169,20 +171,31 @@ def h1_persistence(volume, *, connectivity=26, output_dir=None,
             max_operations=max_operations, max_fill=max_fill,
             max_heap_entries=max_heap_entries, max_trace_bytes=max_trace_bytes,
             max_pairs=max_pairs, max_seconds=max_seconds, local_first=local_first,
+            indexed_scheduler=indexed_scheduler,
         )
         records = morse.h1_records(
             max_operations=cohomology_max_operations,
             max_seconds=cohomology_max_seconds,
+            max_annotation_entries=cohomology_max_annotation_entries,
+            max_output_pairs=cohomology_max_output_pairs,
         )
         pair_ids = (() if not store_pair_ids else
                     tuple(f'{int(morse.ids[r["creator"]])}:{int(morse.ids[r["destroyer"]])}'
                           for r in records))
+        # Persisted cohomology statistics are part of the native completed
+        # catalog. Resource limits apply to sparse entries, not whole-process RSS.
+        import json
+        cohomology_meta = json.loads((morse.path / 'h1_pairs_metadata.json').read_text())
+        statistics = dict(morse.stats)
+        statistics['cohomology_peak_annotation_entries'] = int(
+            cohomology_meta.get('peak_annotation_entries', 0))
+        statistics['cohomology_operations'] = int(cohomology_meta.get('operations', 0))
         result = H1MorseResult(
             births=np.asarray(records['birth'], dtype=v.dtype).copy(),
             deaths=np.asarray(records['death'], dtype=v.dtype).copy(),
             pair_ids=pair_ids,
             catalog_path=Path(output_dir).resolve(),
-            statistics=morse.stats, compact_pair_ids=not store_pair_ids,
+            statistics=statistics, compact_pair_ids=not store_pair_ids,
             _scratch=scratch,
         )
         if np.any(result.births >= result.deaths):

@@ -143,6 +143,36 @@ For the Betti curve alone, `--backend curve` is the default and supports either 
 
 **Verification and limits.** With `validate_betti=True`, the Morse barcode-derived Betti-1 curve is checked at *every integer intensity threshold* against the independently calculated H0 + H2 − Euler curve. The closed-voxel convention, finite barcode semantics, and half-open intervals `[birth, death)` are required for that comparison. The algorithm imposes explicit bounds on the full cubical cell count, candidate heap, cancellation log, native reduction work, and replay output. Long-lived or complicated loops can be costly to reconstruct; the reported cycle is an algebraically valid representative, not necessarily a shortest or geometrically unique loop. `torchPersLay` is a separate, optional downstream analysis tool and is not required.
 
+## Bounded native H1 scheduling
+
+The optional Morse backend has an opt-in `indexed_scheduler=True` mode that holds at most one live cancellation candidate per lower cell and respects `max_heap_entries`. It replenishes the bounded candidate window as reduction progresses instead of abandoning simplification when the initial queue is full. Valid same-filtration cancellations preserve persistent homology, even when a queue, time or work budget stops further simplification. Different scheduler choices can give different *representatives and cell IDs* while preserving the birth/death barcode.
+
+Native H1 cohomology writes completed intervals directly to a compact binary catalog (16 bytes per interval), avoiding an in-memory list of all persistence pairs. It has independent limits `cohomology_max_annotation_entries` for live sparse annotation nonzeros and `cohomology_max_output_pairs` for saved intervals. A budget failure never writes completion metadata. **These limits do not bound total process memory**: precursor arrays, native sparse vectors, trace data, and mapped files still need resources. The previous scheduler remains the default; choose the indexed mode explicitly.
+
+```python
+from betti_curves_py import h1_persistence
+result = h1_persistence(
+    "volume.npy", connectivity=26, output_dir="h1_catalog",
+    indexed_scheduler=True, max_heap_entries=100_000,
+    max_operations=80_000_000,
+    cohomology_max_annotation_entries=3_000_000,
+    cohomology_max_output_pairs=2_000_000,
+    max_cells=20_000_000, store_pair_ids=False,
+)
+print(len(result), result.statistics)
+```
+
+For the CLI, use `--indexed-scheduler`, `--max-heap-entries`, `--max-morse-operations`, `--cohomology-max-annotation-entries`, and `--cohomology-max-output-pairs` with `--backend morse --connectivity 26`. The included benchmark can independently check Betti-1 from 26-connected foreground components, 6-connected enclosed background components, and closed-voxel Euler characteristic:
+
+```bash
+python benchmarks/benchmark_h1_scalability.py --size 32 \
+  --indexed-scheduler --max-heap-entries 100000 --validate
+```
+
+On one synthetic random **128³** 8-level uint8 volume, the complete H1 barcode contained **312,335 intervals**. A minimally reduced run took 25.70 s and peaked at 2,798 MiB; indexed scheduling with a 100,000-entry candidate window reduced 15.57 million post-collapse cells to 1.12 million, taking 35.13 s and peaking at 2,633 MiB. Both barcodes agreed at all eight thresholds with independently computed Betti-1 curves. A geometrically simple 256³ tunnel produced the interval (0,5), with a certified four-edge cycle, in 7.08 s and 1,106 MiB peak RSS. Measurements are individual CPU runs, not general performance guarantees.
+
+**General high-entropy 256³–512³ H1 is not yet solved.** Candidate and annotation limits improve budget control, but the full critical complex and much of the native cohomology state remain in RAM. Further work is needed on external-memory or compressed annotation matrices and cost-aware reduction scheduling.
+
 ## Python API
 
 ```python
