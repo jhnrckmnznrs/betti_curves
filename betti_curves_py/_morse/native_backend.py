@@ -13,12 +13,13 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import json
 import numpy as np
 from ._csr import prepare_complex
 
 class _Stats(ctypes.Structure):
-    _fields_=[(key,ctypes.c_uint64) for key in ('remaining','pairs','operations','trace_bytes','nonfree','tile_pairs','hit_budget')]
+    _fields_=[(key,ctypes.c_uint64) for key in ('remaining','pairs','operations','trace_bytes','nonfree','tile_pairs','hit_budget','adaptive_stopped','adaptive_windows')]
 
 _build_lock=threading.Lock()
 
@@ -44,7 +45,7 @@ def build_native(*,cache_dir=None):
                  ctypes.POINTER(ctypes.c_uint64),ctypes.POINTER(ctypes.c_uint32),ctypes.c_uint64,
                  ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,ctypes.c_int32,
                  ctypes.c_uint64,ctypes.c_uint64,ctypes.c_uint64,ctypes.c_uint64,ctypes.c_uint64,
-                 ctypes.c_double,ctypes.c_char_p,ctypes.POINTER(_Stats),ctypes.c_char_p,ctypes.c_uint64]
+                 ctypes.c_double,ctypes.c_double,ctypes.c_uint64,ctypes.c_uint64,ctypes.c_char_p,ctypes.POINTER(_Stats),ctypes.c_char_p,ctypes.c_uint64]
     fn.restype=ctypes.c_int
     fn._owner_dll=dll
     return fn
@@ -54,13 +55,20 @@ class CompactMorse:
                  max_cells=3_000_000,max_operations=8_000_000,max_fill=128,
                  max_heap_entries=8_000_000,max_trace_bytes=300_000_000,
                  max_pairs=10_000_000,max_seconds=90.,local_first=False,
-                 indexed_scheduler=False):
+                 indexed_scheduler=False,adaptive_cohomology_ns_per_cell=0.0,
+                 adaptive_window=4096,adaptive_patience=2):
         import time
         t=time.perf_counter()
         self.path=Path(output_dir).resolve();self.path.mkdir(parents=True,exist_ok=True)
         for name,v in [('max_operations',max_operations),('max_fill',max_fill),('max_heap_entries',max_heap_entries),('max_trace_bytes',max_trace_bytes),('max_pairs',max_pairs)]:
             if not isinstance(v,int) or v<=0:raise ValueError(f'{name} must be a positive integer')
         if max_seconds<=0:raise ValueError('max_seconds must be positive')
+        if not np.isfinite(adaptive_cohomology_ns_per_cell) or adaptive_cohomology_ns_per_cell<0:
+            raise ValueError('adaptive_cohomology_ns_per_cell must be finite and nonnegative')
+        if adaptive_cohomology_ns_per_cell and not indexed_scheduler:
+            raise ValueError('Adaptive stopping requires indexed_scheduler=True')
+        if not isinstance(adaptive_window,int) or adaptive_window<1 or not isinstance(adaptive_patience,int) or adaptive_patience<1:
+            raise ValueError('adaptive_window and adaptive_patience must be positive integers')
         prep=prepare_complex(volume,pre_collapse=pre_collapse,block_voxels=block_voxels,max_cells=max_cells)
         self.shape=prep['shape'];self.pre_stats=prep['stats']
         for name in ('ids','levels','dims','offsets','data'):
@@ -72,11 +80,13 @@ class CompactMorse:
                 ptr('offsets',ctypes.c_uint64),ptr('data',ctypes.c_uint32),len(prep['ids']),
                 self.shape[1],self.shape[2],block_voxels,int(local_first),int(indexed_scheduler),max_operations,
                 max_fill,max_heap_entries,max_trace_bytes,max_pairs,float(max_seconds),
+                float(adaptive_cohomology_ns_per_cell),int(adaptive_window),int(adaptive_patience),
                 str(self.path).encode(),ctypes.byref(stats),err,512)
         if code:raise RuntimeError('Native Morse: '+err.value.decode())
         self.stats={key:int(getattr(stats,key)) for key,_ in _Stats._fields_}
         self.stats.update(self.pre_stats);self.stats['seconds']=time.perf_counter()-t
         self.stats['indexed_scheduler']=bool(indexed_scheduler)
+        self.stats['adaptive_cohomology_ns_per_cell']=float(adaptive_cohomology_ns_per_cell)
         (self.path/'metadata.json').write_text(json.dumps({'shape': self.shape, 'stats': self.stats}), encoding='utf8')
         self._init_views()
 
@@ -335,6 +345,7 @@ class CompactMorse:
             meta_path = self.path / 'h1_pairs_metadata.json'
             meta_path.unlink(missing_ok=True)
             target = self.path / 'h1_pairs.bin'
+            cohomology_started = time.perf_counter()
             code = run(ptr(self.ids, ctypes.c_uint32),
                        ptr(self.levels, ctypes.c_int32),
                        ptr(self.dims, ctypes.c_uint8), len(self.ids),
@@ -344,6 +355,7 @@ class CompactMorse:
                        len(self.critical), int(max_operations), int(max_annotation_entries), int(max_output_pairs), float(max_seconds),
                        str(target).encode(), ctypes.byref(count),
                        ctypes.byref(operations), ctypes.byref(peak_entries), err, 512)
+            cohomology_seconds = time.perf_counter() - cohomology_started
             if code:
                 raise RuntimeError('Native H1: ' + err.value.decode())
             if target.stat().st_size != count.value * self._H1_RECORD_DTYPE.itemsize:
@@ -351,7 +363,8 @@ class CompactMorse:
             metadata = dict(format=1, count=int(count.value),
                             signature=self._h1_inputs_signature(),
                             operations=int(operations.value),
-                            peak_annotation_entries=int(peak_entries.value))
+                            peak_annotation_entries=int(peak_entries.value),
+                            cohomology_seconds=cohomology_seconds)
             temp_meta = self.path / 'h1_pairs_metadata.build.json'
             temp_meta.write_text(json.dumps(metadata), encoding='utf8')
             os.replace(temp_meta, meta_path)

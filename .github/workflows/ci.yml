@@ -26,4 +26,4 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install -e '.[fast,stream,morse,test]'
-      - run: python -m pytest -q tests/test_euler_stream.py tests/test_euler_parallel.py tests/test_core.py tests/test_streaming.py tests/test_h1_morse_integration.py tests/test_h1_scalability_cache.py tests/test_h1_memory_scheduler.py
+      - run: python -m pytest -q tests/test_euler_stream.py tests/test_euler_parallel.py tests/test_core.py tests/test_streaming.py tests/test_h1_morse_integration.py tests/test_h1_scalability_cache.py tests/test_h1_memory_scheduler.py tests/test_h1_adaptive.py

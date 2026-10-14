@@ -22,6 +22,10 @@ def main(argv=None):
                         help='Bounded one-candidate-per-face Morse scheduler')
     parser.add_argument('--max-heap-entries', type=int, default=8_000_000)
     parser.add_argument('--max-morse-operations', type=int, default=8_000_000)
+    parser.add_argument('--adaptive-cohomology-ns-per-cell', type=float, default=0.0,
+                        help='Experimental cost estimate; 0 disables adaptive stopping (default)')
+    parser.add_argument('--adaptive-window', type=int, default=4096)
+    parser.add_argument('--adaptive-patience', type=int, default=2)
     parser.add_argument('--cohomology-max-annotation-entries', type=int, default=50_000_000)
     parser.add_argument('--cohomology-max-output-pairs', type=int, default=10_000_000)
     parser.add_argument('--no-validation', action='store_true')
@@ -40,6 +44,9 @@ def main(argv=None):
                 'max_seconds':args.max_seconds,'block_voxels':args.block_voxels,
                 'indexed_scheduler':args.indexed_scheduler,'max_heap_entries':args.max_heap_entries,
                 'max_operations':args.max_morse_operations,
+                'adaptive_cohomology_ns_per_cell':args.adaptive_cohomology_ns_per_cell,
+                'adaptive_window':args.adaptive_window,
+                'adaptive_patience':args.adaptive_patience,
                 'cohomology_max_annotation_entries':args.cohomology_max_annotation_entries,
                 'cohomology_max_output_pairs':args.cohomology_max_output_pairs}
                if args.backend=='morse' else {})

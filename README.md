@@ -173,6 +173,25 @@ On one synthetic random **128³** 8-level uint8 volume, the complete H1 barcode 
 
 **General high-entropy 256³–512³ H1 is not yet solved.** Candidate and annotation limits improve budget control, but the full critical complex and much of the native cohomology state remain in RAM. Further work is needed on external-memory or compressed annotation matrices and cost-aware reduction scheduling.
 
+### Experimental adaptive Morse stopping
+
+An optional marginal-cost rule can stop algebraic Morse cancellations when recent cancellation time exceeds an estimated saving in the later H1 cohomology pass. It is **disabled by default**. Every performed cancellation remains a filtration-compatible chain equivalence, so stopping early changes runtime and representative-cell identifiers, not the persistence barcode.
+
+```python
+from betti_curves_py import h1_persistence
+result = h1_persistence(
+    volume, connectivity=26, output_dir="h1_catalog",
+    indexed_scheduler=True,
+    adaptive_cohomology_ns_per_cell=800.0,
+    adaptive_window=4096, adaptive_patience=2,
+)
+print(result.statistics["adaptive_stopped"])
+```
+
+The rule measures elapsed time in consecutive cancellation windows, each removing two critical generators per pivot, and compares it with `2 * window * adaptive_cohomology_ns_per_cell`. The cost estimate in nanoseconds per critical cell must come from representative prior workloads or a sensitivity experiment. The previous job's observed mean can be calculated as `1e9 * statistics["cohomology_seconds"] / statistics["remaining"]`, but this is **not** a guaranteed marginal saving or an automatically calibrated optimal parameter. Larger estimates allow more work. The default of zero leaves cancellation behavior unchanged. The option requires `indexed_scheduler=True` and retains all resource-budget checks.
+
+Use `betti-h1-py ... --backend morse --indexed-scheduler --adaptive-cohomology-ns-per-cell 800` for the equivalent command-line option. For reproducible comparisons, run `python benchmarks/benchmark_h1_adaptive.py --size 32 --seed 11`, which verifies equality of barcode multisets under minimal, adaptive, and extensive Morse work. On tested random 64³ workloads, the adaptive rule was faster than extensive simplification, but was **not reliably faster than very limited simplification**. It is an experimental scheduling option rather than a general high-entropy large-volume solution.
+
 ## Python API
 
 ```python

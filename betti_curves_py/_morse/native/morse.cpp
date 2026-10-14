@@ -15,7 +15,7 @@
 #include <limits>
 
 struct Stats {
-  uint64_t remaining,pairs,operations,trace_bytes,nonfree,tile_pairs,hit_budget;
+  uint64_t remaining,pairs,operations,trace_bytes,nonfree,tile_pairs,hit_budget,adaptive_stopped,adaptive_windows;
 };
 using U=uint32_t;
 using V=std::vector<U>;
@@ -69,6 +69,7 @@ extern "C" int compact_morse_run(
   const U* data,uint64_t n,int32_t ny,int32_t nz,int32_t block_voxels,
   int local_first,int indexed_scheduler,uint64_t max_operations,uint64_t max_fill,uint64_t max_heap,
   uint64_t max_trace_bytes,uint64_t max_pairs,double max_seconds,
+  double adaptive_cohomology_ns_per_cell,uint64_t adaptive_window,uint64_t adaptive_patience,
   const char* output_dir,Stats* stats,char*err,uint64_t err_size) {
  try {
   using Clock=std::chrono::steady_clock;
@@ -86,13 +87,16 @@ extern "C" int compact_morse_run(
     }
   }
   for(V& row:rows)std::sort(row.begin(),row.end());
+  if(adaptive_cohomology_ns_per_cell<0.0 ||
+     (adaptive_cohomology_ns_per_cell>0.0 && (!indexed_scheduler || !adaptive_window || !adaptive_patience)))
+    throw std::runtime_error("Invalid adaptive stopping configuration");
   const std::string base(output_dir);
   std::ofstream tr(base+"/trace.bin",std::ios::binary|std::ios::trunc);
   std::ofstream idx(base+"/trace_offsets.bin",std::ios::binary|std::ios::trunc);
   if(!tr||!idx)throw std::runtime_error("Cannot create trace files");
   uint64_t trace_bytes=0;
   uint64_t pairs=0,ops=0,nonfree=0,tile_pairs=0;
-  bool hit=false;
+  bool hit=false,adaptive_stopped=false;uint64_t adaptive_windows=0;
   auto tile=[&](U i){
     uint64_t p=ids[i],sz=2ull*nz+1,sy=2ull*ny+1;
     return std::make_tuple(p/(sy*sz)/(2*block_voxels),((p/sz)%sy)/(2*block_voxels),(p%sz)/(2*block_voxels));
@@ -170,6 +174,25 @@ extern "C" int compact_morse_run(
 
   auto indexed_phase=[&](bool local){
     IndexedCandidates heap(n);
+    // A per-input forecast, not a theorem about cohomology cost.  A completed
+    // window of cancellations removes exactly two critical cells per pair.
+    // Stop if the measured time to remove them persistently exceeds the user's
+    // estimated time those cells would cost downstream.  No partial pivot is
+    // ever executed: every finished cancellation is a filtered chain homotopy.
+    auto checkpoint_time=Clock::now();
+    uint64_t checkpoint_pairs=pairs, unprofitable_windows=0;
+    auto checkpoint=[&](){
+      if(adaptive_cohomology_ns_per_cell<=0.0||pairs-checkpoint_pairs<adaptive_window)return false;
+      auto now=Clock::now();
+      double observed_ns=std::chrono::duration<double,std::nano>(now-checkpoint_time).count();
+      double saved_ns=2.0*static_cast<double>(pairs-checkpoint_pairs)*adaptive_cohomology_ns_per_cell;
+      adaptive_windows++;
+      if(observed_ns>saved_ns)unprofitable_windows++;
+      else unprofitable_windows=0;
+      checkpoint_time=now;checkpoint_pairs=pairs;
+      if(unprofitable_windows>=adaptive_patience){adaptive_stopped=true;return true;}
+      return false;
+    };
     bool skipped=false;
     auto pick=[&](U a){
       heap.erase(a);
@@ -236,13 +259,14 @@ extern "C" int compact_morse_run(
       for(U f:cols[a])erase_val(rows[f],a);
       cols[a].clear();cols[b].clear();rows[a].clear();rows[b].clear();alive[a]=0;alive[b]=0;
       ops+=best.cost;pairs++;
+      if(checkpoint())return;
       std::sort(touched.begin(),touched.end());touched.erase(std::unique(touched.begin(),touched.end()),touched.end());
       for(U f:touched)if(alive[f])pick(f);
       refill();
     }
     if(skipped)hit=true;
   };
-  if(indexed_scheduler){if(local_first){indexed_phase(true);if(!hit&&pairs<max_pairs)indexed_phase(false);}
+  if(indexed_scheduler){if(local_first){indexed_phase(true);if(!hit&&!adaptive_stopped&&pairs<max_pairs)indexed_phase(false);}
     else indexed_phase(false);}
   else {if(local_first){phase(true);if(!hit&&pairs<max_pairs)phase(false);}
     else phase(false);}
@@ -263,7 +287,7 @@ extern "C" int compact_morse_run(
   }
   surv.close();off.close();dat.close();
   if(!surv||!off||!dat)throw std::runtime_error("Critical CSR write failure");
-  *stats=Stats{remaining,pairs,ops,trace_bytes,nonfree,tile_pairs,hit?1ull:0ull};
+  *stats=Stats{remaining,pairs,ops,trace_bytes,nonfree,tile_pairs,hit?1ull:0ull,adaptive_stopped?1ull:0ull,adaptive_windows};
   return 0;
  }catch(const std::exception& e){
    if(err_size){std::strncpy(err,e.what(),err_size-1);err[err_size-1]='\0';}
