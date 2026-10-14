@@ -12,15 +12,20 @@ dependencies = ["numpy>=1.26,<3", "tifffile>=2024.1.1"]
 
 [project.optional-dependencies]
 fast = ["numba>=0.59"]
+morse = ["numba>=0.59"]
 stream = ["scipy>=1.11"]
 test = ["pytest>=8", "scipy>=1.11", "scikit-image>=0.21"]
 
 [project.scripts]
 betti-curves-py = "betti_curves_py.cli:main"
 betti-euler-py = "betti_curves_py.euler_stream:main"
+betti-h1-py = "betti_curves_py.h1_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["betti_curves_py*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+"betti_curves_py._morse" = ["native/*.cpp"]

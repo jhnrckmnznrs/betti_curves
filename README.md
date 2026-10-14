@@ -91,6 +91,56 @@ python -m betti_curves_py.euler_cli sample/ \
 
 This produces `h1_betti_curve.csv`. It describes **how many** tunnels exist at each threshold. It does not identify individual tunnel birth and death pairs. The library also supports sampled-threshold H1 counts if full H0/H2 persistence is too costly.
 
+## Optional exact H1 persistence and spatial loops
+
+The ordinary `H1 = H0 + H2 - Euler` calculation provides the **Betti-1 curve**, not the birth/death pairing of individual tunnels. An optional native algebraic Morse backend can also compute the finite **H1 persistence barcode**, preserve unique creator/destroyer pair identifiers, and reconstruct a selected original-grid loop with a chain certificate. The existing H0/H2 and streaming Euler methods remain the default for large volumes.
+
+Install the optional native backend (Python 3.10+, NumPy, Numba and a local C++17 compiler such as `g++`):
+
+```bash
+python -m pip install -e '.[morse]'
+```
+
+No native binary is bundled. Its C++ code is compiled on first use and cached locally. The backend is experimental; it is neither a generally out-of-core solver nor a promise of tractability for arbitrary 256³ or 512³ intensity fields.
+
+The Morse backend **requires `connectivity=26`**, using the closed-voxel sublevel cubical complex with voxel-minimum face filtration. The 6-connected mode is based on a different cubical model and is not interchangeable with it. Use the same input, exact threshold order, and convention when comparing the independent Betti curve and H1 barcode.
+
+```python
+import numpy as np
+from betti_curves_py import analyze_volume
+
+volume = np.load('sample_volume.npy', mmap_mode='r')
+result = analyze_volume(
+    volume,
+    connectivity=26,
+    h1_backend='morse',
+    output_dir='h1_catalog',
+    validate_betti=True,
+    max_cells=3_000_000,
+)
+
+print(result.h1_betti_curve)
+print(result.h1.pairs())
+print(result.h1.pair_ids)
+
+if len(result.h1):
+    certificate = result.h1.reconstruct(result.h1.pair_ids[0])
+    print(certificate['verified'], certificate['cycle_cells'])
+```
+
+For a persistent catalog without recomputing H0, H2, and Euler, call `h1_persistence(volume, connectivity=26, output_dir='h1_catalog')`. The result also offers `at(thresholds)` and `betti_curve()`; interval indices remain associated with their exact pair IDs even when multiple bars share the same birth/death values. A persistent catalog is necessary for reconstructing geometry in a later process. Without `output_dir`, the result owns temporary files that are removed by `result.close()` or when the object is destroyed.
+
+Use the standalone CLI to write `h1_betti_curve.csv` and, in Morse mode, `h1_persistence.csv` and the selective-replay catalog:
+
+```bash
+betti-h1-py sample_volume.npy --backend morse --connectivity 26 \
+  --max-cells 3000000 --output-dir h1_results
+```
+
+For the Betti curve alone, `--backend curve` is the default and supports either connectivity convention. The optional unified API also defaults to `h1_backend='curve'`. A full independent H0/H2/Euler computation can certify a zero Betti-1 curve; if so, `analyze_volume` safely skips the expensive Morse reduction because no positive-length H1 intervals can exist.
+
+**Verification and limits.** With `validate_betti=True`, the Morse barcode-derived Betti-1 curve is checked at *every integer intensity threshold* against the independently calculated H0 + H2 − Euler curve. The closed-voxel convention, finite barcode semantics, and half-open intervals `[birth, death)` are required for that comparison. The algorithm imposes explicit bounds on the full cubical cell count, candidate heap, cancellation log, native reduction work, and replay output. Long-lived or complicated loops can be costly to reconstruct; the reported cycle is an algebraically valid representative, not necessarily a shortest or geometrically unique loop. `torchPersLay` is a separate, optional downstream analysis tool and is not required.
+
 ## Python API
 
 ```python
