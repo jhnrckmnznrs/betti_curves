@@ -53,6 +53,7 @@ class H1MorseResult:
     catalog_path: Path | None
     statistics: dict[str, Any] = field(default_factory=dict)
     skipped_empty: bool = False
+    compact_pair_ids: bool = False
     _scratch: Any = field(default=None, repr=False, compare=False)
 
     @property
@@ -94,18 +95,44 @@ class H1MorseResult:
         change = np.flatnonzero(deltas)
         return [(int(event_levels[i]), int(counts[i])) for i in change]
 
+    def pair_id_at(self, index):
+        """Return one exact creator:destroyer ID without expanding all IDs."""
+        if not 0 <= index < len(self):
+            raise IndexError('H1 pair index out of range')
+        if not self.compact_pair_ids:
+            return self.pair_ids[index]
+        if self.catalog_path is None:
+            raise RuntimeError('No H1 catalog available')
+        from ._morse.native_backend import CompactMorse
+        return CompactMorse.open(self.catalog_path).h1_pair_at(index)[0]
+
+    def iter_pair_ids(self):
+        """Stream exact pair IDs without making a tuple of every ID."""
+        if not self.compact_pair_ids:
+            yield from self.pair_ids
+            return
+        if self.catalog_path is None:
+            raise RuntimeError('No H1 catalog available')
+        from ._morse.native_backend import CompactMorse
+        morse = CompactMorse.open(self.catalog_path)
+        for row in morse.h1_records():
+            creator = int(morse.ids[row['creator']])
+            destroyer = int(morse.ids[row['destroyer']])
+            yield f'{creator}:{destroyer}'
+
     def reconstruct(self, pair_id, *, max_operations=100_000_000,
                     max_output_entries=2_000_000, max_seconds=120.):
         """Selectively lift and verify a single persistence loop by exact pair ID."""
-        if pair_id not in self.pair_ids:
-            raise ValueError('Pair ID not found in this catalog')
         if self.catalog_path is None:
-            raise RuntimeError('No Morse catalog available for reconstruction')
+            raise ValueError('Pair ID not found in this catalog')
         from ._morse.native_backend import CompactMorse
-        return CompactMorse.open(self.catalog_path).replay_h1_native(
-            pair_id, max_operations=max_operations,
-            max_output_entries=max_output_entries, max_seconds=max_seconds
-        )
+        try:
+            return CompactMorse.open(self.catalog_path).replay_h1_native(
+                pair_id, max_operations=max_operations,
+                max_output_entries=max_output_entries, max_seconds=max_seconds
+            )
+        except ValueError as exc:
+            raise ValueError('Pair ID not found in this catalog') from exc
 
     def close(self):
         if self._scratch is not None:
@@ -120,7 +147,8 @@ def h1_persistence(volume, *, connectivity=26, output_dir=None,
                    max_heap_entries=8_000_000, max_trace_bytes=300_000_000,
                    max_pairs=10_000_000, max_seconds=90., local_first=False,
                    cohomology_max_operations=100_000_000,
-                   cohomology_max_seconds=120.):
+                   cohomology_max_seconds=120.,
+                   store_pair_ids=True):
     """Exact finite H1 persistence with bounded native Morse reduction.
 
     The full cubical complex currently must fit in memory.  Larger inputs
@@ -142,20 +170,24 @@ def h1_persistence(volume, *, connectivity=26, output_dir=None,
             max_heap_entries=max_heap_entries, max_trace_bytes=max_trace_bytes,
             max_pairs=max_pairs, max_seconds=max_seconds, local_first=local_first,
         )
-        catalog = morse.h1_pairs(
+        records = morse.h1_records(
             max_operations=cohomology_max_operations,
             max_seconds=cohomology_max_seconds,
         )
+        pair_ids = (() if not store_pair_ids else
+                    tuple(f'{int(morse.ids[r["creator"]])}:{int(morse.ids[r["destroyer"]])}'
+                          for r in records))
         result = H1MorseResult(
-            births=np.asarray([entry[1] for entry in catalog], dtype=v.dtype),
-            deaths=np.asarray([entry[2] for entry in catalog], dtype=v.dtype),
-            pair_ids=tuple(entry[0] for entry in catalog),
+            births=np.asarray(records['birth'], dtype=v.dtype).copy(),
+            deaths=np.asarray(records['death'], dtype=v.dtype).copy(),
+            pair_ids=pair_ids,
             catalog_path=Path(output_dir).resolve(),
-            statistics=morse.stats, _scratch=scratch,
+            statistics=morse.stats, compact_pair_ids=not store_pair_ids,
+            _scratch=scratch,
         )
-        if any(b >= d for b, d in result.pairs()):
+        if np.any(result.births >= result.deaths):
             raise AssertionError('Native engine emitted a non-positive persistence interval')
-        if len(set(result.pair_ids)) != len(result):
+        if store_pair_ids and len(set(result.pair_ids)) != len(result):
             raise AssertionError('Native engine emitted duplicate pair identifiers')
         return result
     except BaseException:

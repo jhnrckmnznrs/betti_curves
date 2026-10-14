@@ -128,6 +128,8 @@ if len(result.h1):
     print(certificate['verified'], certificate['cycle_cells'])
 ```
 
+**Memory-conscious H1 catalogs.** The completed native H1 barcode is cached on disk and reused for selective reconstruction. Pair lookup uses a lazily created, sorted creator index, so requesting one representative does not rerun the cohomology pass or materialize a dictionary of all persistence pairs. Reopened catalogs validate input file sizes and modification timestamps before reusing cached results; do not concurrently modify a catalog while reading it. For very large barcodes, set `store_pair_ids=False` in `h1_persistence(...)` or `analyze_volume(..., h1_backend='morse')` to avoid storing one Python string per interval. Use `result.h1.pair_id_at(i)` or `result.h1.iter_pair_ids()` to access exact pair IDs on demand. The default retains the original `pair_ids` tuple for compatibility. This reduces catalog and replay overhead, but does not make the native sparse Morse reducer fully out of core.
+
 For a persistent catalog without recomputing H0, H2, and Euler, call `h1_persistence(volume, connectivity=26, output_dir='h1_catalog')`. The result also offers `at(thresholds)` and `betti_curve()`; interval indices remain associated with their exact pair IDs even when multiple bars share the same birth/death values. A persistent catalog is necessary for reconstructing geometry in a later process. Without `output_dir`, the result owns temporary files that are removed by `result.close()` or when the object is destroyed.
 
 Use the standalone CLI to write `h1_betti_curve.csv` and, in Morse mode, `h1_persistence.csv` and the selective-replay catalog:
